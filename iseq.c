@@ -2482,3 +2482,83 @@ Init_ISeq(void)
     rb_undef_method(CLASS_OF(rb_cISeq), "translate");
     rb_undef_method(CLASS_OF(rb_cISeq), "load_iseq");
 }
+
+
+#if USE_EXECUTED_CHECK
+#include <ctype.h>
+
+char *trim_string(char *str)
+{
+    int end_idx;
+    if (*str == 0) { return str; }
+    end_idx = 0;
+    while(end_idx < strlen(str) && isalnum((unsigned char) str[end_idx])) { end_idx++; }
+    str[end_idx] = 0;
+    return str;
+}
+
+// Assume revision file at project path root
+char* read_revision(const char *project_path)
+{
+    int c;
+    char *postfix = "REVISION";
+    char *revision_path = malloc(strlen(project_path) + strlen(postfix));
+    strcpy(revision_path, project_path);
+    strcat(revision_path, postfix);
+
+    char *buffer = 0;
+    int length;
+    FILE *file = fopen(revision_path, "rb");
+    if (file) {
+	fseek(file, 0, SEEK_END);
+	length = ftell(file);
+	fseek(file, 0, SEEK_SET);
+	buffer = malloc(length);
+	if (buffer) {
+	    fread(buffer, 1, length, file);
+	}
+	fclose(file);
+	return trim_string(buffer);
+    }
+
+    return NULL;
+}
+
+bool is_target(const char *project_path, const char *iseq_path)
+{
+    int project_path_len = strlen(project_path);
+    int iseq_path_len = strlen(iseq_path);
+    if (iseq_path_len < project_path_len) { return false; }
+    int i;
+    for (i=0; i < project_path_len; i++) {
+	if (iseq_path[i] != project_path[i]) {
+	    return false;
+	}
+    }
+    return true;
+}
+
+void
+rb_iseq_executed_check_dump(rb_iseq_t *iseq)
+{
+    iseq->flags |= ISEQ_FL_EXECUTED;
+    char *output_path = getenv("IE_OUTPUT_PATH");
+    if (output_path == NULL) { return; }
+    /* char *project_path = getenv("IE_PROJECT_PATH"); */
+    /* if (project_path == NULL) { return; } */
+    /* char *revision = read_revision(project_path); */
+    /* if (revision == NULL) { return; } */
+
+    char *iseq_path = RSTRING_PTR(rb_iseq_path(iseq));
+    /* if (is_target(project_path, iseq_path)) { */
+	FILE *fp = fopen(output_path, "a");
+	/* int project_path_len = strlen(project_path); */
+	/* char *relative_path = &iseq_path[project_path_len]; */
+	// Export with csv format
+	/* fprintf(fp, "\"%s\",\"%s\",\"%d\"\n", revision, relative_path, FIX2INT(rb_iseq_first_lineno(iseq))); */
+	fprintf(fp, "\"%s\",\"%d\"\n", iseq_path, FIX2INT(rb_iseq_first_lineno(iseq)));
+	fclose(fp);
+    /* } */
+    /* free(revision); */
+}
+#endif
