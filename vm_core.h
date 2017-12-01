@@ -412,12 +412,27 @@ struct rb_iseq_struct {
 const rb_iseq_t *rb_iseq_complete(const rb_iseq_t *iseq);
 #endif
 
+#ifndef USE_EXECUTED_CHECK
+#define USE_EXECUTED_CHECK 1
+#endif
+
+#define ISEQ_FL_EXECUTED IMEMO_FL_USER0
+
+#if USE_EXECUTED_CHECK
+void rb_iseq_executed_check_dump(rb_iseq_t *iseq);
+#endif
+
 static inline const rb_iseq_t *
 rb_iseq_check(const rb_iseq_t *iseq)
 {
 #if USE_LAZY_LOAD
     if (iseq->body == NULL) {
 	rb_iseq_complete((rb_iseq_t *)iseq);
+    }
+#endif
+#if USE_EXECUTED_CHECK
+    if ((iseq->flags & ISEQ_FL_EXECUTED) == 0) {
+       rb_iseq_executed_check_dump((rb_iseq_t *)iseq);
     }
 #endif
     return iseq;

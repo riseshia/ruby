@@ -2482,3 +2482,27 @@ Init_ISeq(void)
     rb_undef_method(CLASS_OF(rb_cISeq), "translate");
     rb_undef_method(CLASS_OF(rb_cISeq), "load_iseq");
 }
+
+
+#if USE_EXECUTED_CHECK
+static VALUE
+rb_iseq_logger_s_log(VALUE mod, VALUE path, VALUE line, VALUE label)
+{
+    return Qnil;
+}
+static VALUE rb_mIseqLogger;
+
+void
+rb_iseq_executed_check_dump(rb_iseq_t *iseq)
+{
+    iseq->flags |= ISEQ_FL_EXECUTED;
+    if (!rb_mIseqLogger)
+    {
+	rb_mIseqLogger = rb_define_module("IseqLogger");
+	rb_define_method(rb_mIseqLogger, "log", rb_iseq_logger_s_log, 3);
+	rb_extend_object(rb_mIseqLogger, rb_mIseqLogger);
+    }
+
+    rb_funcall(rb_mIseqLogger, rb_intern("log"), 3, rb_iseq_path(iseq), rb_iseq_first_lineno(iseq), rb_iseq_label(iseq));
+}
+#endif
