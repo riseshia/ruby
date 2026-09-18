@@ -161,3 +161,41 @@ report("Coord dup") { Coord.new(1, 2).dup }
 report("Point Marshal") { Marshal.load(Marshal.dump(Point.new(1, [2]))) }
 report("Coord Marshal") { Marshal.load(Marshal.dump(Coord.new(1, [2]))) }
 report("memsize Point / Wide") { [ObjectSpace.memsize_of(Point.new(1, 2)), ObjectSpace.memsize_of(Wide.new)] }
+
+section "initialize defined after instances were already created"
+LateCoord = Data.define(:x, :y)
+report("before override") { LateCoord.new(1, 2) }
+LateCoord.class_eval do
+  def initialize(x:, y:)
+    puts "    LateCoord#initialize x=#{x.inspect} y=#{y.inspect}"
+    super(x: x * 10, y:)
+  end
+end
+report("after override") { LateCoord.new(1, 2) }
+
+PrependedCoord = Data.define(:x, :y)
+report("before prepend") { PrependedCoord.new(1, 2) }
+PrependedCoord.prepend(Module.new {
+  def initialize(**kwargs)
+    puts "    prepended initialize #{kwargs.inspect}"
+    super
+  end
+})
+report("after prepend") { PrependedCoord.new(1, 2) }
+
+report("subclass without initialize") { Class.new(Coord).new(1, 2) }
+report("subclass with initialize") { Class.new(Coord) { def initialize(x:, y:) = super(x: y, y: x) }.new(1, 2) }
+report("define block with initialize") { Data.define(:a) { def initialize(a:) = super(a: a.to_s) }.new(1) }
+report("default through initialize") { Data.define(:a, :b) { def initialize(a:, b: 0) = super }.new(1) }
+
+section "Data#initialize itself replaced"
+class Data
+  alias_method :__probe_original_initialize, :initialize
+
+  def initialize(**kwargs)
+    puts "    Data#initialize replaced, got #{kwargs.inspect}"
+    __probe_original_initialize(**kwargs)
+  end
+end
+report("Coord.new(1, 2)") { Coord.new(1, 2) }
+report("Coord.new(x: 1, y: 2)") { Coord.new(x: 1, y: 2) }
