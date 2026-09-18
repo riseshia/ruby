@@ -1,0 +1,121 @@
+# Prints everything a Ruby program can observe about constructing Struct / Data instances.
+# Run it with a baseline build and a patched build: the two outputs must be identical.
+#
+#   ./ruby misc/struct_new_observable_probe.rb > probe.txt
+
+require "objspace"
+
+Point = Struct.new(:x, :y)
+KeywordPoint = Struct.new(:x, :y, keyword_init: true)
+PositionalPoint = Struct.new(:x, :y, keyword_init: false)
+Wide = Struct.new(*(1..200).map { :"m#{_1}" })
+Coord = Data.define(:x, :y)
+
+class TracedPoint < Struct.new(:x, :y)
+  def initialize(*args)
+    puts "    caller labels: #{caller_locations(0, 4).map(&:label).inspect}"
+    super
+  end
+end
+
+class TracedCoord < Data.define(:x, :y)
+  def initialize(**kwargs)
+    puts "    caller labels: #{caller_locations(0, 4).map(&:label).inspect}"
+    super
+  end
+end
+
+def section(title)
+  puts "\n== #{title}"
+end
+
+def report(label)
+  value = yield
+  puts "  #{label}: #{value.inspect} frozen=#{value.frozen?}"
+rescue => error
+  puts "  #{label}: #{error.class}: #{error.message}"
+  puts "    backtrace labels: #{error.backtrace_locations.first(4).map(&:label).inspect}"
+end
+
+def trace_events(label)
+  events = []
+  tracer = TracePoint.new(:c_call, :c_return, :call, :return, :raise) { |tp|
+    events << "#{tp.event} #{tp.defined_class.inspect}##{tp.method_id}"
+  }
+  begin
+    tracer.enable { yield }
+  rescue => error
+    events << "rescued #{error.class}"
+  end
+  puts "  #{label}:"
+  events.each { puts "    #{_1}" }
+end
+
+def allocation_info(label)
+  object = nil
+  ObjectSpace.trace_object_allocations { object = yield }
+  puts "  #{label}: method=#{ObjectSpace.allocation_method_id(object).inspect} " \
+       "class_path=#{ObjectSpace.allocation_class_path(object).inspect} " \
+       "file=#{File.basename(ObjectSpace.allocation_sourcefile(object).to_s)}"
+end
+
+section "results"
+report("Point.new(1, 2)") { Point.new(1, 2) }
+report("Point.new(1)") { Point.new(1) }
+report("Point.new") { Point.new }
+report("Point[1, 2]") { Point[1, 2] }
+report("Point.new({x: 1})") { Point.new({x: 1}) }
+report("Point.new(x: 1)") { Point.new(x: 1) }
+report("Point.new({x: 1}, 2)") { Point.new({x: 1}, 2) }
+report("KeywordPoint.new(x: 1, y: 2)") { KeywordPoint.new(x: 1, y: 2) }
+report("PositionalPoint.new(x: 1)") { PositionalPoint.new(x: 1) }
+report("Wide.new(1, 2)") { Wide.new(1, 2).to_a.first(3) }
+report("Coord.new(1, 2)") { Coord.new(1, 2) }
+report("Coord.new(x: 1, y: 2)") { Coord.new(x: 1, y: 2) }
+report("Coord[1, 2]") { Coord[1, 2] }
+
+section "errors"
+report("Point.new(1, 2, 3)") { Point.new(1, 2, 3) }
+report("KeywordPoint.new(1, 2)") { KeywordPoint.new(1, 2) }
+report("KeywordPoint.new(1)") { KeywordPoint.new(1) }
+report("KeywordPoint.new(z: 1)") { KeywordPoint.new(z: 1) }
+report("Point.new(z: 1)") { Point.new(z: 1) }
+report("Wide.new(*1..201)") { Wide.new(*1..201) }
+report("Coord.new(1)") { Coord.new(1) }
+report("Coord.new(1, 2, 3)") { Coord.new(1, 2, 3) }
+report("Coord.new(x: 1, z: 2)") { Coord.new(x: 1, z: 2) }
+report("Coord.new(1, y: 2)") { Coord.new(1, y: 2) }
+
+section "initialize called again"
+report("unfrozen struct, fewer args") { Point.new(1, 2).tap { _1.send(:initialize, 9) } }
+report("unfrozen struct, no args") { Point.new(1, 2).tap { _1.send(:initialize) } }
+report("frozen struct") { Point.new(1, 2).freeze.send(:initialize, 9) }
+report("data") { Coord.new(1, 2).send(:initialize, x: 9, y: 9) }
+
+section "overridden initialize"
+report("TracedPoint.new(1, 2)") { TracedPoint.new(1, 2) }
+report("TracedPoint.new(1, 2, 3)") { TracedPoint.new(1, 2, 3) }
+report("TracedCoord.new(1, 2)") { TracedCoord.new(1, 2) }
+report("TracedCoord.new(x: 1, y: 2)") { TracedCoord.new(x: 1, y: 2) }
+report("TracedCoord.new(1)") { TracedCoord.new(1) }
+
+section "TracePoint events"
+trace_events("Point.new(1, 2)") { Point.new(1, 2) }
+trace_events("Point.new(1, 2, 3)") { Point.new(1, 2, 3) }
+trace_events("KeywordPoint.new(x: 1, y: 2)") { KeywordPoint.new(x: 1, y: 2) }
+trace_events("Coord.new(1, 2)") { Coord.new(1, 2) }
+trace_events("Coord.new(x: 1, y: 2)") { Coord.new(x: 1, y: 2) }
+trace_events("Coord.new(1)") { Coord.new(1) }
+
+section "allocation tracing"
+allocation_info("Point.new(1, 2)") { Point.new(1, 2) }
+allocation_info("KeywordPoint.new(x: 1, y: 2)") { KeywordPoint.new(x: 1, y: 2) }
+allocation_info("Coord.new(1, 2)") { Coord.new(1, 2) }
+allocation_info("Coord.new(x: 1, y: 2)") { Coord.new(x: 1, y: 2) }
+
+section "copies and round trips"
+report("Point dup") { Point.new(1, 2).dup }
+report("Coord dup") { Coord.new(1, 2).dup }
+report("Point Marshal") { Marshal.load(Marshal.dump(Point.new(1, [2]))) }
+report("Coord Marshal") { Marshal.load(Marshal.dump(Coord.new(1, [2]))) }
+report("memsize Point / Wide") { [ObjectSpace.memsize_of(Point.new(1, 2)), ObjectSpace.memsize_of(Wide.new)] }
