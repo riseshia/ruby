@@ -190,9 +190,8 @@ struct_set_members(VALUE klass, VALUE /* frozen hidden array */ members)
 }
 
 static inline int
-struct_member_pos(VALUE s, VALUE name)
+struct_member_pos_in(VALUE s, VALUE name, VALUE back)
 {
-    VALUE back = struct_ivar_get(rb_obj_class(s), id_back_members);
     long j, mask;
 
     if (UNLIKELY(NIL_P(back))) {
@@ -234,6 +233,12 @@ struct_member_pos(VALUE s, VALUE name)
         }
         j = struct_member_pos_probe(j, mask);
     }
+}
+
+static inline int
+struct_member_pos(VALUE s, VALUE name)
+{
+    return struct_member_pos_in(s, name, struct_ivar_get(rb_obj_class(s), id_back_members));
 }
 
 /*
@@ -766,18 +771,19 @@ num_members(VALUE klass)
 struct struct_hash_set_arg {
     VALUE self;
     VALUE unknown_keywords;
-    VALUE missing_keywords;
+    VALUE back_members;
+    char *found;
     long missing_count;
 };
 
 static int rb_struct_pos(VALUE s, VALUE *name, bool name_only);
+static int struct_pos_cached(VALUE s, VALUE *name, bool name_only, VALUE *back);
 static VALUE deconstruct_keys(VALUE s, VALUE keys, bool name_only);
-static int rb_struct_pos(VALUE s, VALUE *name, bool name_only);
 
 static int
 struct_hash_aset(VALUE key, VALUE val, struct struct_hash_set_arg *args, bool name_only)
 {
-    int i = rb_struct_pos(args->self, &key, name_only);
+    int i = struct_pos_cached(args->self, &key, name_only, &args->back_members);
     if (i < 0) {
         if (NIL_P(args->unknown_keywords)) {
             args->unknown_keywords = rb_ary_new();
@@ -1220,19 +1226,21 @@ rb_struct_init_copy(VALUE copy, VALUE s)
     return copy;
 }
 
+// +back+ caches __back_members__ across calls for the same struct; start it at 0.
+// It is filled on first use so that errors are raised at the same point as before.
 static int
-rb_struct_pos(VALUE s, VALUE *name, bool name_only)
+struct_pos_cached(VALUE s, VALUE *name, bool name_only, VALUE *back)
 {
     long i;
     VALUE idx = *name;
 
-    if (SYMBOL_P(idx)) {
-        return struct_member_pos(s, idx);
-    }
-    else if (name_only || RB_TYPE_P(idx, T_STRING)) {
+    if (!SYMBOL_P(idx) && (name_only || RB_TYPE_P(idx, T_STRING))) {
         idx = rb_check_symbol(name);
         if (NIL_P(idx)) return -1;
-        return struct_member_pos(s, idx);
+    }
+    if (SYMBOL_P(idx)) {
+        if (!*back) *back = struct_ivar_get(rb_obj_class(s), id_back_members);
+        return struct_member_pos_in(s, idx, *back);
     }
     else {
         long len;
@@ -1251,6 +1259,13 @@ rb_struct_pos(VALUE s, VALUE *name, bool name_only)
         }
         return (int)i;
     }
+}
+
+static int
+rb_struct_pos(VALUE s, VALUE *name, bool name_only)
+{
+    VALUE back = 0;
+    return struct_pos_cached(s, name, name_only, &back);
 }
 
 static void
@@ -1799,12 +1814,9 @@ data_hash_set_i(VALUE key, VALUE val, VALUE arg)
 {
     struct struct_hash_set_arg *args = (struct struct_hash_set_arg *)arg;
     int i = struct_hash_aset(key, val, args, true);
-    if (i >= 0 && args->missing_count > 0) {
-        VALUE k = RARRAY_AREF(args->missing_keywords, i);
-        if (!NIL_P(k)) {
-            RARRAY_ASET(args->missing_keywords, i, Qnil);
-            args->missing_count--;
-        }
+    if (i >= 0 && !args->found[i]) {
+        args->found[i] = 1;
+        args->missing_count--;
     }
     return ST_CONTINUE;
 }
@@ -1878,12 +1890,11 @@ rb_data_initialize_m(int argc, const VALUE *argv, VALUE self)
 {
     VALUE klass = rb_obj_class(self);
     rb_struct_modify(self);
-    VALUE members = struct_ivar_get(klass, id_members);
-    size_t num_members = RARRAY_LEN(members);
+    long num_members = RSTRUCT_LEN_RAW(self);
 
     if (argc == 0) {
         if (num_members > 0) {
-            rb_exc_raise(rb_keyword_error_new("missing", members));
+            rb_exc_raise(rb_keyword_error_new("missing", struct_ivar_get(klass, id_members)));
         }
         OBJ_FREEZE(self);
         return Qnil;
@@ -1892,13 +1903,14 @@ rb_data_initialize_m(int argc, const VALUE *argv, VALUE self)
         rb_error_arity(argc, 0, 0);
     }
 
-    VALUE missing = rb_ary_dup(members);
-    RBASIC_CLEAR_CLASS(missing);
+    VALUE found_buffer;
+    char *found = ALLOCV_N(char, found_buffer, num_members);
+    MEMZERO(found, char, num_members);
     struct struct_hash_set_arg arg = {
         .self = self,
         .unknown_keywords = Qnil,
-        .missing_keywords = missing,
-        .missing_count = (long)num_members,
+        .found = found,
+        .missing_count = num_members,
     };
     rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), num_members);
     rb_hash_foreach(argv[0], data_hash_set_i, (VALUE)&arg);
@@ -1906,11 +1918,14 @@ rb_data_initialize_m(int argc, const VALUE *argv, VALUE self)
     // unfrozen copy on the heap, which could get exposed via ObjectSpace.
     OBJ_FREEZE(self);
     if (UNLIKELY(arg.missing_count > 0)) {
-        rb_ary_compact_bang(missing);
-        RUBY_ASSERT(RARRAY_LEN(missing) == arg.missing_count, "missing_count=%ld but %ld", arg.missing_count, RARRAY_LEN(missing));
-        RBASIC_SET_CLASS_RAW(missing, rb_cArray);
+        VALUE members = struct_ivar_get(klass, id_members);
+        VALUE missing = rb_ary_new_capa(arg.missing_count);
+        for (long i = 0; i < num_members; i++) {
+            if (!found[i]) rb_ary_push(missing, RARRAY_AREF(members, i));
+        }
         rb_exc_raise(rb_keyword_error_new("missing", missing));
     }
+    ALLOCV_END(found_buffer);
     VALUE unknown_keywords = arg.unknown_keywords;
     if (UNLIKELY(!NIL_P(unknown_keywords))) {
         RBASIC_SET_CLASS_RAW(unknown_keywords, rb_cArray);
