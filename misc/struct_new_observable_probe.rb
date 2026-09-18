@@ -86,6 +86,23 @@ report("Coord.new(1, 2, 3)") { Coord.new(1, 2, 3) }
 report("Coord.new(x: 1, z: 2)") { Coord.new(x: 1, z: 2) }
 report("Coord.new(1, y: 2)") { Coord.new(1, y: 2) }
 
+section "keyword_init through subclasses, copies and the C API"
+report("Class.new(KeywordPoint).new(1, 2)") { Class.new(KeywordPoint).new(1, 2) }
+report("Class.new(KeywordPoint).new(x: 1)") { Class.new(KeywordPoint).new(x: 1).to_a }
+report("Class.new(Point).new(1, 2)") { Class.new(Point).new(1, 2).to_a }
+report("KeywordPoint.dup.new(1, 2)") { KeywordPoint.dup.new(1, 2) }
+report("KeywordPoint.dup.new(x: 1)") { KeywordPoint.dup.new(x: 1).to_a }
+report("KeywordPoint.clone.new(1)") { KeywordPoint.clone.new(1) }
+report("keyword_init: 1, positional") { Struct.new(:a, keyword_init: 1).new(1) }
+report("keyword_init: 1, keyword") { Struct.new(:a, keyword_init: 1).new(a: 1).to_a }
+report("keyword_init: nil, positional") { Struct.new(:a, keyword_init: nil).new(1).to_a }
+report("PositionalPoint.new({x: 1})") { PositionalPoint.new({x: 1}).to_a }
+report("Process::Tms.new(1, 2, 3, 4)") { Process::Tms.new(1, 2, 3, 4).to_a }
+report("Process::Tms.new(utime: 1)") { Process::Tms.new(utime: 1).to_a }
+report("KeywordPoint.allocate") { KeywordPoint.allocate.to_a }
+report("keyword_init? values") { [Point, KeywordPoint, PositionalPoint, Class.new(KeywordPoint), KeywordPoint.dup].map(&:keyword_init?) }
+report("initialize owner") { [Point, KeywordPoint].map { _1.instance_method(:initialize).owner } }
+
 section "initialize called again"
 report("unfrozen struct, fewer args") { Point.new(1, 2).tap { _1.send(:initialize, 9) } }
 report("unfrozen struct, no args") { Point.new(1, 2).tap { _1.send(:initialize) } }
