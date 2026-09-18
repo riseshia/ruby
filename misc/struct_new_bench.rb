@@ -1,4 +1,5 @@
 # The three operations backed by the ruby-bench headline tally: reader, writer, positional new.
+# The "class" column is a hand-written class doing the same job, the speed Struct / Data are compared to.
 # Usage: ruby [--yjit|--zjit] core3_bench.rb
 
 class Plain2
@@ -47,12 +48,12 @@ Data2 = Data.define(:x, :y)
 Data5 = Data.define(:a, :b, :c, :d, :e)
 
 CASES = {
-  "reader" => {"plain" => "o.x", "Struct" => "s.x", "Data" => "d.x"},
-  "writer" => {"plain" => "o.x = 1", "Struct" => "s.x = 1"},
-  "new 2 members" => {"plain" => "Plain2.new(1, 2)", "Struct" => "Struct2.new(1, 2)", "Data" => "Data2.new(1, 2)"},
-  "new 5 members" => {"plain" => "Plain5.new(1, 2, 3, 4, 5)", "Struct" => "Struct5.new(1, 2, 3, 4, 5)", "Data" => "Data5.new(1, 2, 3, 4, 5)"},
-"new 2 keywords" => {"plain" => "PlainKw2.new(x: 1, y: 2)", "Struct" => "StructKw2.new(x: 1, y: 2)", "Data" => "Data2.new(x: 1, y: 2)"},
-"new 5 keywords" => {"plain" => "PlainKw5.new(a: 1, b: 2, c: 3, d: 4, e: 5)", "Struct" => "StructKw5.new(a: 1, b: 2, c: 3, d: 4, e: 5)", "Data" => "Data5.new(a: 1, b: 2, c: 3, d: 4, e: 5)"},
+  "reader" => {"class" => "o.x", "Struct" => "s.x", "Data" => "d.x"},
+  "writer" => {"class" => "o.x = 1", "Struct" => "s.x = 1"},
+  "new 2 members" => {"class" => "Plain2.new(1, 2)", "Struct" => "Struct2.new(1, 2)", "Data" => "Data2.new(1, 2)"},
+  "new 5 members" => {"class" => "Plain5.new(1, 2, 3, 4, 5)", "Struct" => "Struct5.new(1, 2, 3, 4, 5)", "Data" => "Data5.new(1, 2, 3, 4, 5)"},
+"new 2 keywords" => {"class" => "PlainKw2.new(x: 1, y: 2)", "Struct" => "StructKw2.new(x: 1, y: 2)", "Data" => "Data2.new(x: 1, y: 2)"},
+"new 5 keywords" => {"class" => "PlainKw5.new(a: 1, b: 2, c: 3, d: 4, e: 5)", "Struct" => "StructKw5.new(a: 1, b: 2, c: 3, d: 4, e: 5)", "Data" => "Data5.new(a: 1, b: 2, c: 3, d: 4, e: 5)"},
 }.freeze
 
 ITERATIONS = 5_000_000
@@ -84,9 +85,9 @@ args = [Plain2.new(1, 2), Struct2.new(1, 2), Data2.new(1, 2)]
 define_runner(:run_empty, "o")
 overhead = measure_ns(:run_empty, args)
 
-puts format("%-15s %8s %8s %8s", "op", "plain", "Struct", "Data")
+puts format("%-15s %8s %8s %8s", "op", "class", "Struct", "Data")
 CASES.each_with_index do |(label, exprs), idx|
-  cells = %w[plain Struct Data].map { |kind|
+  cells = %w[class Struct Data].map { |kind|
     expr = exprs[kind] or next "-"
     runner = :"run_#{idx}_#{kind}"
     define_runner(runner, expr)
