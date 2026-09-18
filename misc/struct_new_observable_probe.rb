@@ -103,6 +103,31 @@ report("KeywordPoint.allocate") { KeywordPoint.allocate.to_a }
 report("keyword_init? values") { [Point, KeywordPoint, PositionalPoint, Class.new(KeywordPoint), KeywordPoint.dup].map(&:keyword_init?) }
 report("initialize owner") { [Point, KeywordPoint].map { _1.instance_method(:initialize).owner } }
 
+section "Data keyword edge cases"
+BigCoord = Data.define(*(1..12).map { :"m#{_1}" })
+Empty = Data.define
+StringLike = Struct.new(:to_str)
+report("string keys") { Coord.new("x" => 1, "y" => 2) }
+report("symbol and string for one member") { Coord.new(:x => 1, "x" => 2, :y => 3) }
+report("same member twice, other missing") { Coord.new(:x => 1, "x" => 2) }
+report("integer key") { Coord.new(0 => 1, 1 => 2) }
+report("to_str key") { Coord.new(StringLike.new("x") => 1, y: 2) }
+report("nil key") { Coord.new(nil => 1) }
+report("missing first") { Coord.new(y: 2) }
+report("missing both") { Coord.new(**{}) }
+report("unknown and missing") { Coord.new(z: 1) }
+report("two unknown") { Coord.new(x: 1, y: 2, z: 3, w: 4) }
+report("explicit nil member") { Coord.new(x: nil, y: nil) }
+report("BigCoord positional") { BigCoord.new(*1..12).to_h.values.sum }
+report("BigCoord missing order") { BigCoord.new(m12: 1, m3: 1, m7: 1) }
+report("BigCoord unknown") { BigCoord.new(**(1..12).to_h { [:"m#{_1}", _1] }, nope: 1) }
+report("Empty.new") { Empty.new }
+report("Empty.new(x: 1)") { Empty.new(x: 1) }
+report("Struct keyword_init string and integer keys") { KeywordPoint.new("x" => 1, 1 => 2) }
+report("Struct keyword_init unknown") { KeywordPoint.new(x: 1, "nope" => 2, 5 => 3) }
+report("Coord with") { Coord.new(1, 2).with(y: 5) }
+report("Coord with unknown") { Coord.new(1, 2).with(z: 5) }
+
 section "initialize called again"
 report("unfrozen struct, fewer args") { Point.new(1, 2).tap { _1.send(:initialize, 9) } }
 report("unfrozen struct, no args") { Point.new(1, 2).tap { _1.send(:initialize) } }
