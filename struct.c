@@ -356,6 +356,27 @@ rb_struct_s_inspect(VALUE klass)
     return inspect;
 }
 
+// With every member given, the built-in Data#initialize cannot raise and runs
+// no Ruby code, so the only traces of calling it are its c_call / c_return
+// events. Without a hook for those, filling the members directly is
+// indistinguishable from building the keyword Hash and calling it.
+static bool
+data_initialize_unobservable_p(VALUE klass)
+{
+    return ruby_vm_c_events_enabled == 0 && rb_method_basic_definition_p(klass, idInitialize);
+}
+
+static VALUE
+data_initialize_positional(VALUE self, VALUE members, int argc, const VALUE *argv)
+{
+    VALUE arg_hash = rb_hash_new_capa(argc);
+    for (long i = 0; i < argc; i++) {
+        rb_hash_aset(arg_hash, rb_ary_entry(members, i), argv[i]);
+    }
+    rb_obj_call_init_kw(self, 1, &arg_hash, RB_PASS_KEYWORDS);
+    return self;
+}
+
 static VALUE
 rb_data_s_new(int argc, const VALUE *argv, VALUE klass)
 {
@@ -370,6 +391,17 @@ rb_data_s_new(int argc, const VALUE *argv, VALUE klass)
         int num_members = RARRAY_LENINT(members);
 
         rb_check_arity(argc, 0, num_members);
+        if (argc == num_members && data_initialize_unobservable_p(klass)) {
+            VALUE self = rb_obj_alloc(klass);
+            if (RB_TYPE_P(self, T_STRUCT) && RSTRUCT_LEN_RAW(self) == argc && !OBJ_FROZEN(self)) {
+                for (long i = 0; i < argc; i++) {
+                    RSTRUCT_SET_RAW(self, i, argv[i]);
+                }
+                OBJ_FREEZE(self);
+                return self;
+            }
+            return data_initialize_positional(self, members, argc, argv);
+        }
         VALUE arg_hash = rb_hash_new_capa(argc);
         for (long i=0; i<argc; i++) {
             VALUE k = rb_ary_entry(members, i), v = argv[i];
