@@ -1176,14 +1176,25 @@ rb_struct_to_h(VALUE s)
     VALUE h = rb_hash_new_capa(RSTRUCT_LEN_RAW(s));
     VALUE members = rb_struct_members(s);
     long i;
-    int block_given = rb_block_given_p();
+
+    if (!rb_block_given_p()) {
+        // Member names are distinct Symbols, so the pairs can go in without
+        // the per-key work of rb_hash_aset().
+        long len = RSTRUCT_LEN_RAW(s);
+        VALUE buffer;
+        VALUE *pairs = ALLOCV_N(VALUE, buffer, len * 2);
+        for (i = 0; i < len; i++) {
+            pairs[i * 2] = RARRAY_AREF(members, i);
+            pairs[i * 2 + 1] = RSTRUCT_GET_RAW(s, i);
+        }
+        rb_hash_bulk_insert(len * 2, pairs, h);
+        ALLOCV_END(buffer);
+        return h;
+    }
 
     for (i=0; i<RSTRUCT_LEN_RAW(s); i++) {
         VALUE k = rb_ary_entry(members, i), v = RSTRUCT_GET_RAW(s, i);
-        if (block_given)
-            rb_hash_set_pair(h, rb_yield_values(2, k, v));
-        else
-            rb_hash_aset(h, k, v);
+        rb_hash_set_pair(h, rb_yield_values(2, k, v));
     }
     return h;
 }
