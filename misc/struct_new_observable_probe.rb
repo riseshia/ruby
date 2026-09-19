@@ -150,6 +150,20 @@ report("object count after 1000 failures") do
   ObjectSpace.each_object(Coord).count { !_1.frozen? }
 end
 
+section "Data#with"
+report("with two members") { Coord.new(1, 2).with(y: 5, x: 4) }
+report("with nothing") { c = Coord.new(1, 2); c.with.equal?(c) }
+report("with string key") { Coord.new(1, 2).with("y" => 5) }
+report("with same member twice") { Coord.new(1, 2).with(:y => 5, "y" => 6) }
+report("with unknown") { Coord.new(1, 2).with(y: 5, z: 6) }
+report("with positional") { Coord.new(1, 2).with(1) }
+report("with on overridden initialize") { TracedCoord.new(1, 2).with(y: 5) }
+report("with does not copy ivars") { c = Coord.new(1, 2); c2 = c.with(y: 3); [c2, c2.instance_variables] }
+report("with keeps singleton-less class") { Class.new(Coord).new(1, 2).with(x: 9).class.superclass }
+trace_events("with traced") { Coord.new(1, 2).with(y: 5) }
+allocation_info("with allocation") { Coord.new(1, 2).with(y: 5) }
+report("BigCoord with") { BigCoord.new(*1..12).with(m12: 0, m1: 0).to_h.values }
+
 section "initialize called again"
 report("unfrozen struct, fewer args") { Point.new(1, 2).tap { _1.send(:initialize, 9) } }
 report("unfrozen struct, no args") { Point.new(1, 2).tap { _1.send(:initialize) } }
