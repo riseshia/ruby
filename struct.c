@@ -1242,9 +1242,10 @@ deconstruct_keys(VALUE s, VALUE keys, bool name_only)
         return rb_hash_new();
     }
     h = rb_hash_new_capa(RARRAY_LEN(keys));
+    VALUE back = 0;
     for (i=0; i<RARRAY_LEN(keys); i++) {
         VALUE key = RARRAY_AREF(keys, i);
-        int i = rb_struct_pos(s, &key, name_only);
+        int i = struct_pos_cached(s, &key, name_only, &back);
         if (i < 0) {
             return h;
         }
