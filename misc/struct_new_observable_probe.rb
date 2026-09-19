@@ -312,6 +312,21 @@ report("member hash freezes and empties the struct, then re-hashes") do
   {owner => 1}.size
 end
 
+section "deconstruct_keys"
+report("some keys") { Point.new(1, 2).deconstruct_keys([:y]) }
+report("duplicate keys") { Point.new(1, 2).deconstruct_keys([:x, :x]) }
+report("unknown key stops") { Point.new(1, 2).deconstruct_keys([:x, :nope, :y]) }
+report("string and integer keys on Struct") { Point.new(1, 2).deconstruct_keys(["x", 1]) }
+report("string key on Data") { Coord.new(1, 2).deconstruct_keys(["x"]) }
+report("more keys than members") { Point.new(1, 2).deconstruct_keys([:x, :y, :z]) }
+report("not an Array") { Point.new(1, 2).deconstruct_keys(:x) }
+report("pattern match") do
+  case Coord.new(1, 2)
+  in {x:, y:} then [x, y]
+  end
+end
+report("12 members") { BigCoord.new(*1..12).deconstruct_keys([:m12, :m1]) }
+
 section "Data#initialize itself replaced"
 class Data
   alias_method :__probe_original_initialize, :initialize
