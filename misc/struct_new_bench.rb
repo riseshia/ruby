@@ -59,39 +59,41 @@ CASES = {
 ITERATIONS = 5_000_000
 ROUNDS = 7
 
-def define_runner(name, expr)
-  eval(<<~RUBY, TOPLEVEL_BINDING, __FILE__, __LINE__ + 1)
-    def #{name}(o, s, d, n)
+# Each case gets its own runner and its own measuring method that calls the runner directly.
+# Calling runners through one shared `send` site leaves YJIT specialised on the first runner,
+# and later ones are then measured on a slow path.
+def define_case(name, expr, params)
+  eval(<<~CODE, TOPLEVEL_BINDING, __FILE__, __LINE__ + 1)
+    def run_#{name}(#{[*params, "n"].join(", ")})
       i = 0
       while i < n
         #{expr}
         i += 1
       end
     end
-  RUBY
-end
 
-def measure_ns(runner, args)
-  # JITs count calls, not loop iterations: one long warm-up call would leave the loop interpreted.
-  200.times { send(runner, *args, 1_000) }
-  ROUNDS.times.map {
-    t = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
-    send(runner, *args, ITERATIONS)
-    (Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - t).fdiv(ITERATIONS)
-  }.min
+    def measure_#{name}(#{params.join(", ")})
+      # JITs count calls, not loop iterations: one long warm-up call would leave the loop interpreted.
+      200.times { run_#{name}(#{[*params, "1_000"].join(", ")}) }
+      ROUNDS.times.map {
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+        run_#{name}(#{[*params, "ITERATIONS"].join(", ")})
+        (Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - t).fdiv(ITERATIONS)
+      }.min
+    end
+  CODE
 end
 
 args = [Plain2.new(1, 2), Struct2.new(1, 2), Data2.new(1, 2)]
-define_runner(:run_empty, "o")
-overhead = measure_ns(:run_empty, args)
+define_case(:empty, "o", %w[o s d])
+overhead = measure_empty(*args)
 
 puts format("%-15s %8s %8s %8s", "op", "class", "Struct", "Data")
 CASES.each_with_index do |(label, exprs), idx|
   cells = %w[class Struct Data].map { |kind|
     expr = exprs[kind] or next "-"
-    runner = :"run_#{idx}_#{kind}"
-    define_runner(runner, expr)
-    format("%.1f", measure_ns(runner, args) - overhead)
+    define_case(:"#{idx}_#{kind}", expr, %w[o s d])
+    format("%.1f", send(:"measure_#{idx}_#{kind}", *args) - overhead)
   }
   puts format("%-15s %8s %8s %8s", label, *cells)
 end
