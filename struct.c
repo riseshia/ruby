@@ -191,7 +191,7 @@ struct_set_members(VALUE klass, VALUE /* frozen hidden array */ members)
 }
 
 static inline int
-struct_member_pos_in(VALUE s, VALUE name, VALUE back)
+struct_back_members_pos(VALUE back, long len, VALUE name)
 {
     long j, mask;
 
@@ -205,10 +205,10 @@ struct_member_pos_in(VALUE s, VALUE name, VALUE back)
     mask = RARRAY_LEN(back);
 
     if (mask <= AREF_HASH_THRESHOLD) {
-        if (UNLIKELY(RSTRUCT_LEN_RAW(s) != mask)) {
+        if (UNLIKELY(len != mask)) {
             rb_raise(rb_eTypeError,
                      "struct size differs (%ld required %ld given)",
-                     mask, RSTRUCT_LEN_RAW(s));
+                     mask, len);
         }
         for (j = 0; j < mask; j++) {
             if (RARRAY_AREF(back, j) == name)
@@ -217,9 +217,9 @@ struct_member_pos_in(VALUE s, VALUE name, VALUE back)
         return -1;
     }
 
-    if (UNLIKELY(RSTRUCT_LEN_RAW(s) != FIX2INT(RARRAY_AREF(back, mask-1)))) {
+    if (UNLIKELY(len != FIX2INT(RARRAY_AREF(back, mask-1)))) {
         rb_raise(rb_eTypeError, "struct size differs (%d required %ld given)",
-                 FIX2INT(RARRAY_AREF(back, mask-1)), RSTRUCT_LEN_RAW(s));
+                 FIX2INT(RARRAY_AREF(back, mask-1)), len);
     }
 
     mask -= 3;
@@ -234,6 +234,23 @@ struct_member_pos_in(VALUE s, VALUE name, VALUE back)
         }
         j = struct_member_pos_probe(j, mask);
     }
+}
+
+// Whether struct_back_members_pos(back, len, ...) can run without raising.
+static bool
+struct_back_members_usable_p(VALUE back, long len)
+{
+    if (!RB_TYPE_P(back, T_ARRAY)) return false;
+
+    long mask = RARRAY_LEN(back);
+    if (mask <= AREF_HASH_THRESHOLD) return len == mask;
+    return len == FIX2INT(RARRAY_AREF(back, mask-1));
+}
+
+static inline int
+struct_member_pos_in(VALUE s, VALUE name, VALUE back)
+{
+    return struct_back_members_pos(back, RSTRUCT_LEN_RAW(s), name);
 }
 
 static inline int
@@ -357,6 +374,48 @@ rb_struct_s_inspect(VALUE klass)
     return inspect;
 }
 
+#define KEYWORD_POSITIONS_MAX 16
+
+struct keyword_positions {
+    VALUE back_members;
+    long len;
+    int count;
+    int positions[KEYWORD_POSITIONS_MAX];
+    VALUE values[KEYWORD_POSITIONS_MAX];
+};
+
+static int
+keyword_positions_i(st_data_t key, st_data_t val, st_data_t ptr)
+{
+    struct keyword_positions *kw = (struct keyword_positions *)ptr;
+    VALUE name = (VALUE)key;
+    int pos = SYMBOL_P(name) ? struct_back_members_pos(kw->back_members, kw->len, name) : -1;
+
+    if (pos < 0 || kw->count == KEYWORD_POSITIONS_MAX) {
+        kw->count = -1;
+        return ST_STOP;
+    }
+    kw->positions[kw->count] = pos;
+    kw->values[kw->count] = (VALUE)val;
+    kw->count++;
+    return ST_CONTINUE;
+}
+
+// Resolves every key of +hash+ to a member position of +klass+ (which has +len+
+// members), provided all of them are Symbols naming a member. That runs no Ruby code and changes nothing, so the
+// Hash can be walked without the rb_ensure() rb_hash_foreach() sets up. On
+// false the caller goes on as if this had not been tried.
+static bool
+resolve_keyword_positions(VALUE klass, long len, VALUE hash, struct keyword_positions *kw)
+{
+    *kw = (struct keyword_positions){ .back_members = struct_ivar_get(klass, id_back_members), .len = len };
+    // An inconsistent class is left to the regular path, which raises for it.
+    if (!struct_back_members_usable_p(kw->back_members, len)) return false;
+
+    rb_hash_stlike_foreach(hash, keyword_positions_i, (st_data_t)kw);
+    return kw->count >= 0;
+}
+
 // With every member given, the built-in Data#initialize cannot raise and runs
 // no Ruby code, so the only traces of calling it are its c_call / c_return
 // events. Without a hook for those, filling the members directly is
@@ -384,6 +443,25 @@ rb_data_s_new(int argc, const VALUE *argv, VALUE klass)
     if (rb_keyword_given_p()) {
         if (argc > 1 || !RB_TYPE_P(argv[0], T_HASH)) {
             rb_error_arity(argc, 0, 0);
+        }
+        if (data_initialize_unobservable_p(klass)) {
+            // Same as the positional case below: with every member named once the
+            // built-in initialize can only fill the members and freeze. Keywords
+            // are resolved before allocating so that giving up leaves no instance.
+            long num_members = RARRAY_LEN(struct_ivar_get(klass, id_members));
+            struct keyword_positions kw;
+            if (resolve_keyword_positions(klass, num_members, argv[0], &kw) && kw.count == num_members) {
+                VALUE self = rb_obj_alloc(klass);
+                if (RB_TYPE_P(self, T_STRUCT) && RSTRUCT_LEN_RAW(self) == num_members && !OBJ_FROZEN(self)) {
+                    for (int i = 0; i < kw.count; i++) {
+                        RSTRUCT_SET_RAW(self, kw.positions[i], kw.values[i]);
+                    }
+                    OBJ_FREEZE(self);
+                    return self;
+                }
+                rb_obj_call_init_kw(self, argc, argv, RB_PASS_KEYWORDS);
+                return self;
+            }
         }
         return rb_class_new_instance_pass_kw(argc, argv, klass);
     }
@@ -838,45 +916,6 @@ struct_hash_set_i(VALUE key, VALUE val, VALUE arg)
     return ST_CONTINUE;
 }
 
-#define KEYWORD_POSITIONS_MAX 16
-
-struct keyword_positions {
-    VALUE self;
-    VALUE back_members;
-    int count;
-    int positions[KEYWORD_POSITIONS_MAX];
-    VALUE values[KEYWORD_POSITIONS_MAX];
-};
-
-static int
-keyword_positions_i(st_data_t key, st_data_t val, st_data_t ptr)
-{
-    struct keyword_positions *kw = (struct keyword_positions *)ptr;
-    VALUE name = (VALUE)key;
-    int pos = SYMBOL_P(name) ? struct_pos_cached(kw->self, &name, true, &kw->back_members) : -1;
-
-    if (pos < 0 || kw->count == KEYWORD_POSITIONS_MAX) {
-        kw->count = -1;
-        return ST_STOP;
-    }
-    kw->positions[kw->count] = pos;
-    kw->values[kw->count] = (VALUE)val;
-    kw->count++;
-    return ST_CONTINUE;
-}
-
-// Resolves every key of +hash+ to a member position, provided all of them are
-// Symbols naming a member. That runs no Ruby code and changes nothing, so the
-// Hash can be walked without the rb_ensure() rb_hash_foreach() sets up. On
-// false the caller goes on as if this had not been tried.
-static bool
-resolve_keyword_positions(VALUE self, VALUE hash, struct keyword_positions *kw)
-{
-    *kw = (struct keyword_positions){ .self = self };
-    rb_hash_stlike_foreach(hash, keyword_positions_i, (st_data_t)kw);
-    return kw->count >= 0;
-}
-
 static VALUE
 rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
 {
@@ -907,7 +946,7 @@ rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
         break;
     }
     struct keyword_positions kw;
-    if (keyword_init && resolve_keyword_positions(self, argv[0], &kw)) {
+    if (keyword_init && resolve_keyword_positions(klass, n, argv[0], &kw)) {
         rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
         for (int i = 0; i < kw.count; i++) {
             RSTRUCT_SET_RAW(self, kw.positions[i], kw.values[i]);
@@ -2017,7 +2056,7 @@ rb_data_initialize_m(int argc, const VALUE *argv, VALUE self)
     }
 
     struct keyword_positions kw;
-    if (resolve_keyword_positions(self, argv[0], &kw) && kw.count == num_members) {
+    if (resolve_keyword_positions(klass, num_members, argv[0], &kw) && kw.count == num_members) {
         // Distinct Symbols, as many as there are members: none is missing.
         for (int i = 0; i < kw.count; i++) {
             RSTRUCT_SET_RAW(self, kw.positions[i], kw.values[i]);
@@ -2108,7 +2147,7 @@ data_with_direct(VALUE self, VALUE kwargs)
     if (!data_initialize_unobservable_p(klass)) return Qundef;
 
     struct keyword_positions arg;
-    if (!resolve_keyword_positions(self, kwargs, &arg)) return Qundef;
+    if (!resolve_keyword_positions(klass, RSTRUCT_LEN_RAW(self), kwargs, &arg)) return Qundef;
 
     long n = RSTRUCT_LEN_RAW(self);
     VALUE copy = rb_obj_alloc(klass);
