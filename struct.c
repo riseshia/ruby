@@ -18,6 +18,7 @@
 #include "internal/proc.h"
 #include "internal/struct.h"
 #include "internal/symbol.h"
+#include "shape.h"
 #include "vm_core.h"
 #include "builtin.h"
 
@@ -36,11 +37,46 @@ static ID id_members, id_back_members, id_keyword_init;
 
 static VALUE struct_alloc(VALUE);
 
+// Inline cache for the hidden ivars of Struct / Data classes. Classes made by
+// Struct.new or Data.define set these ivars in the same order and so share one
+// shape: remembering "this shape -> that field index" per ivar turns the lookup
+// into a shape id comparison, like the inline cache of an attr_reader.
+// An entry packs the shape id and the index so that it is read and written in
+// one piece. 0 is never a valid entry: the root shape has no field, and
+// ATTR_INDEX_NOT_SET records that a shape does not have the ivar.
+static uint64_t members_cache, back_members_cache, keyword_init_cache;
+
+static VALUE
+hidden_ivar_get(VALUE klass, ID id)
+{
+    uint64_t *cache =
+        id == id_members ? &members_cache :
+        id == id_back_members ? &back_members_cache :
+        id == id_keyword_init ? &keyword_init_cache : NULL;
+    VALUE fields_obj = RCLASS_WRITABLE_FIELDS_OBJ(klass);
+
+    if (!cache || !fields_obj) return rb_attr_get(klass, id);
+
+    shape_id_t shape_id = RBASIC_SHAPE_ID_FOR_READ(fields_obj);
+    if (rb_shape_complex_p(shape_id)) return rb_attr_get(klass, id);
+
+    uint64_t entry = *cache;
+    attr_index_t index;
+    if (entry && (shape_id_t)(entry >> 32) == shape_id) {
+        index = (attr_index_t)entry;
+    }
+    else {
+        if (!rb_shape_get_iv_index(shape_id, id, &index)) index = ATTR_INDEX_NOT_SET;
+        *cache = ((uint64_t)shape_id << 32) | index;
+    }
+    return index == ATTR_INDEX_NOT_SET ? Qnil : rb_imemo_fields_ptr(fields_obj)[index];
+}
+
 static inline VALUE
 struct_ivar_get(VALUE c, ID id)
 {
     VALUE orig = c;
-    VALUE ivar = rb_attr_get(c, id);
+    VALUE ivar = hidden_ivar_get(c, id);
 
     if (!NIL_P(ivar))
         return ivar;
@@ -50,7 +86,7 @@ struct_ivar_get(VALUE c, ID id)
         if (c == rb_cStruct || c == rb_cData || !RTEST(c))
             return Qnil;
         RUBY_ASSERT(RB_TYPE_P(c, T_CLASS));
-        ivar = rb_attr_get(c, id);
+        ivar = hidden_ivar_get(c, id);
         if (!NIL_P(ivar)) {
             if (!OBJ_FROZEN(orig)) rb_ivar_set(orig, id, ivar);
             return ivar;
