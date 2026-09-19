@@ -843,7 +843,8 @@ rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
 {
     VALUE klass = rb_obj_class(self);
     rb_struct_modify(self);
-    long n = num_members(klass);
+    // struct_alloc() sized self from num_members(klass), so the length is already at hand.
+    long n = RSTRUCT_LEN_RAW(self);
     if (argc == 0) {
         rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
         return Qnil;
