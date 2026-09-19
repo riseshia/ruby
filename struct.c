@@ -838,6 +838,45 @@ struct_hash_set_i(VALUE key, VALUE val, VALUE arg)
     return ST_CONTINUE;
 }
 
+#define KEYWORD_POSITIONS_MAX 16
+
+struct keyword_positions {
+    VALUE self;
+    VALUE back_members;
+    int count;
+    int positions[KEYWORD_POSITIONS_MAX];
+    VALUE values[KEYWORD_POSITIONS_MAX];
+};
+
+static int
+keyword_positions_i(st_data_t key, st_data_t val, st_data_t ptr)
+{
+    struct keyword_positions *kw = (struct keyword_positions *)ptr;
+    VALUE name = (VALUE)key;
+    int pos = SYMBOL_P(name) ? struct_pos_cached(kw->self, &name, true, &kw->back_members) : -1;
+
+    if (pos < 0 || kw->count == KEYWORD_POSITIONS_MAX) {
+        kw->count = -1;
+        return ST_STOP;
+    }
+    kw->positions[kw->count] = pos;
+    kw->values[kw->count] = (VALUE)val;
+    kw->count++;
+    return ST_CONTINUE;
+}
+
+// Resolves every key of +hash+ to a member position, provided all of them are
+// Symbols naming a member. That runs no Ruby code and changes nothing, so the
+// Hash can be walked without the rb_ensure() rb_hash_foreach() sets up. On
+// false the caller goes on as if this had not been tried.
+static bool
+resolve_keyword_positions(VALUE self, VALUE hash, struct keyword_positions *kw)
+{
+    *kw = (struct keyword_positions){ .self = self };
+    rb_hash_stlike_foreach(hash, keyword_positions_i, (st_data_t)kw);
+    return kw->count >= 0;
+}
+
 static VALUE
 rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
 {
@@ -867,7 +906,14 @@ rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
         keyword_init = rb_keyword_given_p();
         break;
     }
-    if (keyword_init) {
+    struct keyword_positions kw;
+    if (keyword_init && resolve_keyword_positions(self, argv[0], &kw)) {
+        rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
+        for (int i = 0; i < kw.count; i++) {
+            RSTRUCT_SET_RAW(self, kw.positions[i], kw.values[i]);
+        }
+    }
+    else if (keyword_init) {
         struct struct_hash_set_arg arg = {
             .self = self,
             .unknown_keywords = Qnil,
@@ -1970,6 +2016,16 @@ rb_data_initialize_m(int argc, const VALUE *argv, VALUE self)
         rb_error_arity(argc, 0, 0);
     }
 
+    struct keyword_positions kw;
+    if (resolve_keyword_positions(self, argv[0], &kw) && kw.count == num_members) {
+        // Distinct Symbols, as many as there are members: none is missing.
+        for (int i = 0; i < kw.count; i++) {
+            RSTRUCT_SET_RAW(self, kw.positions[i], kw.values[i]);
+        }
+        OBJ_FREEZE(self);
+        return Qnil;
+    }
+
     VALUE found_buffer;
     char *found = ALLOCV_N(char, found_buffer, num_members);
     MEMZERO(found, char, num_members);
@@ -2041,32 +2097,6 @@ rb_data_init_copy(VALUE copy, VALUE s)
  *
  */
 
-#define DATA_WITH_KEYWORDS_MAX 16
-
-struct data_with_arg {
-    VALUE self;
-    VALUE back_members;
-    int count;
-    int positions[DATA_WITH_KEYWORDS_MAX];
-    VALUE values[DATA_WITH_KEYWORDS_MAX];
-};
-
-static int
-data_with_resolve_i(VALUE key, VALUE val, VALUE ptr)
-{
-    struct data_with_arg *arg = (struct data_with_arg *)ptr;
-    int pos = SYMBOL_P(key) ? struct_pos_cached(arg->self, &key, true, &arg->back_members) : -1;
-
-    if (pos < 0 || arg->count == DATA_WITH_KEYWORDS_MAX) {
-        arg->count = -1;
-        return ST_STOP;
-    }
-    arg->positions[arg->count] = pos;
-    arg->values[arg->count] = val;
-    arg->count++;
-    return ST_CONTINUE;
-}
-
 // A copy of +self+ with +kwargs+ applied, made without going through
 // initialize; Qundef when that could be told apart from calling it.
 // Every keyword is resolved before allocating: see rb_data_initialize_m()
@@ -2077,9 +2107,8 @@ data_with_direct(VALUE self, VALUE kwargs)
     VALUE klass = rb_obj_class(self);
     if (!data_initialize_unobservable_p(klass)) return Qundef;
 
-    struct data_with_arg arg = { .self = self };
-    rb_hash_foreach(kwargs, data_with_resolve_i, (VALUE)&arg);
-    if (arg.count < 0) return Qundef;
+    struct keyword_positions arg;
+    if (!resolve_keyword_positions(self, kwargs, &arg)) return Qundef;
 
     long n = RSTRUCT_LEN_RAW(self);
     VALUE copy = rb_obj_alloc(klass);
