@@ -128,6 +128,28 @@ report("Struct keyword_init unknown") { KeywordPoint.new(x: 1, "nope" => 2, 5 =>
 report("Coord with") { Coord.new(1, 2).with(y: 5) }
 report("Coord with unknown") { Coord.new(1, 2).with(z: 5) }
 
+section "Data.new call shapes"
+WideCoord = Data.define(*(1..17).map { :"w#{_1}" })
+report("keywords in another order") { Coord.new(y: 2, x: 1) }
+report("Coord[x: 1, y: 2]") { Coord[x: 1, y: 2] }
+report("BigCoord keywords") { BigCoord.new(**(1..12).to_h { [:"m#{_1}", _1] }).m12 }
+report("BigCoord literal keywords") { BigCoord.new(m12: 12, m11: 11, m10: 10, m9: 9, m8: 8, m7: 7, m6: 6, m5: 5, m4: 4, m3: 3, m2: 2, m1: 1).to_h.values }
+report("WideCoord positional") { WideCoord.new(*1..17).w17 }
+report("WideCoord literal positional") { WideCoord.new(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17).w17 }
+report("send(:new)") { Coord.send(:new, 1, 2) }
+report("method(:new).call") { Coord.method(:new).call(x: 1, y: 2) }
+report("block argument") { Coord.new(1, 2, &:itself) }
+report("splat") { Coord.new(*[1, 2]) }
+report("double splat") { Coord.new(**{x: 1, y: 2}) }
+report("positional hash") { Coord.new({x: 1, y: 2}) }
+report("self.new overridden") { Class.new(Coord) { def self.new(*args) = super(*args.reverse) }.new(1, 2) }
+report("Data.new owner / arity") { [Coord.method(:new).owner == Coord.singleton_class, Coord.method(:new).arity, Coord.method(:new).parameters] }
+report("object count after 1000 failures") do
+  1000.times { Coord.new(x: 1) rescue nil }
+  GC.start
+  ObjectSpace.each_object(Coord).count { !_1.frozen? }
+end
+
 section "initialize called again"
 report("unfrozen struct, fewer args") { Point.new(1, 2).tap { _1.send(:initialize, 9) } }
 report("unfrozen struct, no args") { Point.new(1, 2).tap { _1.send(:initialize) } }
