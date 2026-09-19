@@ -2006,6 +2006,65 @@ rb_data_init_copy(VALUE copy, VALUE s)
  *
  */
 
+#define DATA_WITH_KEYWORDS_MAX 16
+
+struct data_with_arg {
+    VALUE self;
+    VALUE back_members;
+    int count;
+    int positions[DATA_WITH_KEYWORDS_MAX];
+    VALUE values[DATA_WITH_KEYWORDS_MAX];
+};
+
+static int
+data_with_resolve_i(VALUE key, VALUE val, VALUE ptr)
+{
+    struct data_with_arg *arg = (struct data_with_arg *)ptr;
+    int pos = SYMBOL_P(key) ? struct_pos_cached(arg->self, &key, true, &arg->back_members) : -1;
+
+    if (pos < 0 || arg->count == DATA_WITH_KEYWORDS_MAX) {
+        arg->count = -1;
+        return ST_STOP;
+    }
+    arg->positions[arg->count] = pos;
+    arg->values[arg->count] = val;
+    arg->count++;
+    return ST_CONTINUE;
+}
+
+// A copy of +self+ with +kwargs+ applied, made without going through
+// initialize; Qundef when that could be told apart from calling it.
+// Every keyword is resolved before allocating: see rb_data_initialize_m()
+// about not leaving an unfrozen instance on the heap.
+static VALUE
+data_with_direct(VALUE self, VALUE kwargs)
+{
+    VALUE klass = rb_obj_class(self);
+    if (!data_initialize_unobservable_p(klass)) return Qundef;
+
+    struct data_with_arg arg = { .self = self };
+    rb_hash_foreach(kwargs, data_with_resolve_i, (VALUE)&arg);
+    if (arg.count < 0) return Qundef;
+
+    long n = RSTRUCT_LEN_RAW(self);
+    VALUE copy = rb_obj_alloc(klass);
+    if (!RB_TYPE_P(copy, T_STRUCT) || RSTRUCT_LEN_RAW(copy) != n || OBJ_FROZEN(copy)) {
+        VALUE h = rb_struct_to_h(self);
+        rb_hash_update_by(h, kwargs, 0);
+        rb_obj_call_init_kw(copy, 1, &h, RB_PASS_KEYWORDS);
+        return copy;
+    }
+
+    for (long i = 0; i < n; i++) {
+        RSTRUCT_SET_RAW(copy, i, RSTRUCT_GET_RAW(self, i));
+    }
+    for (int i = 0; i < arg.count; i++) {
+        RSTRUCT_SET_RAW(copy, arg.positions[i], arg.values[i]);
+    }
+    OBJ_FREEZE(copy);
+    return copy;
+}
+
 static VALUE
 rb_data_with(int argc, const VALUE *argv, VALUE self)
 {
@@ -2014,6 +2073,9 @@ rb_data_with(int argc, const VALUE *argv, VALUE self)
     if (NIL_P(kwargs)) {
         return self;
     }
+
+    VALUE copy = data_with_direct(self, kwargs);
+    if (!UNDEF_P(copy)) return copy;
 
     VALUE h = rb_struct_to_h(self);
     rb_hash_update_by(h, kwargs, 0);
