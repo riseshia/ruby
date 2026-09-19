@@ -164,6 +164,39 @@ trace_events("with traced") { Coord.new(1, 2).with(y: 5) }
 allocation_info("with allocation") { Coord.new(1, 2).with(y: 5) }
 report("BigCoord with") { BigCoord.new(*1..12).with(m12: 0, m1: 0).to_h.values }
 
+section "to_h"
+report("Struct#to_h") { Point.new(1, 2).to_h }
+report("Data#to_h") { Coord.new(1, 2).to_h }
+report("to_h with block") { Point.new(1, 2).to_h { |k, v| [k.to_s, v * 2] } }
+report("to_h block returning a non-pair") { Point.new(1, 2).to_h { |k, v| k } }
+report("to_h of 12 members keeps order") { BigCoord.new(*1..12).to_h.keys }
+report("to_h of 200 members") { h = Wide.new(*1..200).to_h; [h.size, h.keys.first, h.keys.last, h[:m200]] }
+report("to_h result is a plain mutable Hash") { h = Coord.new(1, 2).to_h; h[:z] = 3; [h, h.frozen?, h.compare_by_identity?, h.default] }
+report("deconstruct_keys") { [Point.new(1, 2).deconstruct_keys([:x]), Coord.new(1, 2).deconstruct_keys(nil)] }
+
+section "Data.new reaching an overridden initialize"
+NeedsX = Data.define(:x, :y) { def initialize(x:) = super(x:, y: nil) }
+TakesHash = Data.define(:x, :y) { def initialize(given) = super(**given) }
+TakesRest = Data.define(:x, :y) { def initialize(*args, **kw) = (puts "    args=#{args.inspect} kw=#{kw.inspect}"; super(**kw)) }
+Yields = Data.define(:x, :y) { def initialize(x:, y:) = (puts "    block_given=#{block_given?}"; super) }
+Validates = Data.define(:x, :y) { def initialize(x:, y:) = (raise ArgumentError, "x must be positive" unless x.positive?; super) }
+report("unknown keyword for initialize, positional") { NeedsX.new(1, 2) }
+report("unknown keyword for initialize, keywords") { NeedsX.new(x: 1, y: 2) }
+report("accepted subset") { NeedsX.new(1) }
+report("missing keyword for initialize") { NeedsX.new }
+report("initialize taking a positional Hash, positional") { TakesHash.new(1, 2) }
+report("initialize taking a positional Hash, keywords") { TakesHash.new(x: 1, y: 2) }
+report("initialize taking rest, positional") { TakesRest.new(1, 2) }
+report("initialize taking rest, keywords") { TakesRest.new(y: 2, x: 1) }
+report("block reaches initialize, positional") { Yields.new(1, 2) { } }
+report("block reaches initialize, keywords") { Yields.new(x: 1, y: 2) { } }
+report("raise from initialize, positional") { Validates.new(-1, 2) }
+report("raise from initialize, keywords") { Validates.new(x: -1, y: 2) }
+report("too many positional") { Validates.new(1, 2, 3) }
+trace_events("overridden initialize traced") { Validates.new(1, 2) }
+allocation_info("overridden initialize allocation, positional") { Validates.new(1, 2) }
+allocation_info("overridden initialize allocation, keywords") { Validates.new(x: 1, y: 2) }
+
 section "initialize called again"
 report("unfrozen struct, fewer args") { Point.new(1, 2).tap { _1.send(:initialize, 9) } }
 report("unfrozen struct, no args") { Point.new(1, 2).tap { _1.send(:initialize) } }
@@ -224,6 +257,61 @@ report("subclass with initialize") { Class.new(Coord) { def initialize(x:, y:) =
 report("define block with initialize") { Data.define(:a) { def initialize(a:) = super(a: a.to_s) }.new(1) }
 report("default through initialize") { Data.define(:a, :b) { def initialize(a:, b: 0) = super }.new(1) }
 
+section "== / eql? / hash"
+require "set"
+Pair = Struct.new(:a, :b)
+FrozenPair = Data.define(:a, :b)
+
+class Noisy
+  attr_reader :name
+  def initialize(name, answer = true, &on_compare) = (@name, @answer, @on_compare = name, answer, on_compare)
+  def ==(other) = (puts "    #{@name} == #{other.name}"; @on_compare&.call; @answer)
+  def eql?(other) = (puts "    #{@name} eql? #{other.name}"; @answer)
+  def hash = (puts "    #{@name} hash"; 7)
+end
+
+nan = Float::NAN
+report("equal leaves") { [Pair.new(1, "x") == Pair.new(1, "x"), Pair.new(1, "x").eql?(Pair.new(1, "x"))] }
+report("unequal leaves") { [Pair.new(1, "x") == Pair.new(1, "y"), Pair.new(1, "x").eql?(Pair.new(2, "x"))] }
+report("same NaN object / different NaN") { [Pair.new(nan, 1) == Pair.new(nan, 1), Pair.new(0.0 / 0.0, 1) == Pair.new(0.0 / 0.0, 1)] }
+report("0.0 and -0.0") { [Pair.new(0.0, 1) == Pair.new(-0.0, 1), Pair.new(0.0, 1).eql?(Pair.new(-0.0, 1))] }
+report("1 and 1.0") { [Pair.new(1, 1) == Pair.new(1.0, 1), Pair.new(1, 1).eql?(Pair.new(1.0, 1))] }
+report("bignum and symbols") { [Pair.new(2**80, :s) == Pair.new(2**80, :s), Pair.new(2**80, :s).eql?(Pair.new(2**80, :s))] }
+report("encodings") { Pair.new("é", 1) == Pair.new("é".b, 1) }
+report("other class, same members") { [Pair.new(1, 2) == Struct.new(:a, :b).new(1, 2), FrozenPair.new(1, 2) == Pair.new(1, 2)] }
+report("noisy second member") { Pair.new(1, Noisy.new("left")) == Pair.new(1, Noisy.new("right")) }
+report("noisy first member, second differs") { Pair.new(Noisy.new("left"), 1) == Pair.new(Noisy.new("right"), 2) }
+report("first differs, noisy never asked") { Pair.new(1, Noisy.new("left")) == Pair.new(2, Noisy.new("right")) }
+report("noisy eql?") { Pair.new(1, Noisy.new("left")).eql?(Pair.new(1, Noisy.new("right"))) }
+report("recursive ==") { a = Pair.new(1, nil); a.b = a; b = Pair.new(1, nil); b.b = b; [a == b, a.eql?(b)] }
+report("recursive through Array") { a = Pair.new(1, []); a.b << a; b = Pair.new(1, []); b.b << b; a == b }
+report("recursive hash") { a = Pair.new(1, nil); a.b = a; a.hash == a.hash }
+report("member == mutates the struct and re-enters") do
+  left = Pair.new(1, nil)
+  right = Pair.new(1, nil)
+  left.b = Noisy.new("left") { left.b = 5; right.b = 6; puts "    re-entered: #{left == right}" }
+  right.b = Noisy.new("right")
+  left == right
+end
+
+report("Data as Hash key") { {FrozenPair.new(1, "k") => :found}[FrozenPair.new(1, "k")] }
+report("Struct as Hash key") { {Pair.new(1, "k") => :found}[Pair.new(1, "k")] }
+report("frozen Struct as Hash key") { {Pair.new(1, "k").freeze => :found}[Pair.new(1, "k").freeze] }
+report("hash agrees with Hash lookup") { d = FrozenPair.new(1, "k"); [d.hash == FrozenPair.new(1, "k").hash, {d => 1}.key?(FrozenPair.new(1, "k"))] }
+report("noisy member as key") { {FrozenPair.new(1, Noisy.new("stored")) => :found}[FrozenPair.new(1, Noisy.new("probe"))] }
+report("nested Data key") { {FrozenPair.new(FrozenPair.new(1, 2), 3) => :found}[FrozenPair.new(FrozenPair.new(1, 2), 3)] }
+report("Set and uniq") { [Set[FrozenPair.new(1, 2), FrozenPair.new(1, 2)].size, [Pair.new(1, 2), Pair.new(1, 2)].uniq.size] }
+report("subclass overriding hash") { k = Class.new(FrozenPair) { def hash = (puts "    custom hash"; 1) }; {k.new(1, 2) => :found}[k.new(1, 2)] }
+report("class with singleton hash") { k = Data.define(:a); def k.hash = (puts "    class hash"; 3); {k.new(1) => :found}[k.new(1)] }
+trace_events("Hash lookup traced") { {FrozenPair.new(1, 2) => 1}[FrozenPair.new(1, 2)] }
+report("member hash freezes and empties the struct, then re-hashes") do
+  owner = Pair.new(1, nil)
+  member = Object.new
+  member.define_singleton_method(:hash) { owner.b = 2; owner.freeze; puts "    re-hashed: #{({owner => 1}.size)}"; 9 }
+  owner.b = member
+  {owner => 1}.size
+end
+
 section "Data#initialize itself replaced"
 class Data
   alias_method :__probe_original_initialize, :initialize
@@ -235,3 +323,11 @@ class Data
 end
 report("Coord.new(1, 2)") { Coord.new(1, 2) }
 report("Coord.new(x: 1, y: 2)") { Coord.new(x: 1, y: 2) }
+
+section "Integer#== redefined"
+class Integer
+  alias_method :__probe_original_eq, :==
+  def ==(other) = (puts "    Integer#== #{self} #{other}"; __probe_original_eq(other))
+end
+report("after redefinition") { Pair.new(1, 2) == Pair.new(1, 2) }
+report("Data after redefinition") { FrozenPair.new(1, 2) == FrozenPair.new(1, 3) }
