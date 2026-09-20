@@ -46,6 +46,7 @@ struct RStruct {
 /* struct.c */
 VALUE rb_struct_init_copy(VALUE copy, VALUE s);
 VALUE rb_struct_lookup(VALUE s, VALUE idx);
+VALUE rb_struct_hash(VALUE s);
 VALUE rb_struct_s_keyword_init(VALUE klass);
 void rb_struct_define_aref_method(VALUE nstr, ID name, unsigned int off);
 

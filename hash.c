@@ -38,6 +38,7 @@
 #include "internal/proc.h"
 #include "internal/ractor.h"
 #include "internal/st.h"
+#include "internal/struct.h"
 #include "internal/symbol.h"
 #include "internal/thread.h"
 #include "internal/time.h"
@@ -223,6 +224,44 @@ any_hash(VALUE a, st_index_t (*other_func)(VALUE))
     return (long)hnum;
 }
 
+// Whether any_hash() hashes +a+ by itself, without calling a method.
+static bool
+any_hash_without_call_p(VALUE a)
+{
+    switch (TYPE(a)) {
+      case T_SYMBOL:
+      case T_FIXNUM:
+      case T_TRUE:
+      case T_FALSE:
+      case T_NIL:
+      case T_STRING:
+      case T_BIGNUM:
+      case T_FLOAT:
+        return true;
+      default:
+        return false;
+    }
+}
+
+// Struct#hash / Data#hash used as a Hash key is normally called under
+// rb_exec_recursive_outer(). When every member is hashed by any_hash() itself
+// nothing can re-enter, and when no hash computation is in progress on this
+// thread the guard could not fire either; what is left of the call is its
+// c_call / c_return events. The hash of the class is mixed in as well: that
+// must be the default Kernel#hash, or it is a method call too.
+static bool
+struct_hash_needs_no_guard_p(VALUE s)
+{
+    if (ruby_vm_c_events_enabled > 0 || !rb_exec_recursive_idle_mid_p(id_hash)) return false;
+    if (!rb_method_basic_definition_p(CLASS_OF(rb_obj_class(s)), id_hash)) return false;
+
+    long len = RSTRUCT_LEN_RAW(s);
+    for (long i = 0; i < len; i++) {
+        if (!any_hash_without_call_p(RSTRUCT_GET_RAW(s, i))) return false;
+    }
+    return true;
+}
+
 VALUE rb_obj_hash(VALUE obj);
 VALUE rb_vm_call0(rb_execution_context_t *ec, VALUE recv, ID id, int argc, const VALUE *argv, const rb_callable_method_entry_t *cme, int kw_splat);
 
@@ -237,6 +276,9 @@ obj_any_hash(VALUE obj)
             // Optimize away the frame push overhead if it's the default Kernel#hash
             if (cme->def->type == VM_METHOD_TYPE_CFUNC && cme->def->body.cfunc.func == (rb_cfunc_t)rb_obj_hash) {
                 hval = rb_obj_hash(obj);
+            }
+            else if (cme->def->type == VM_METHOD_TYPE_CFUNC && cme->def->body.cfunc.func == (rb_cfunc_t)rb_struct_hash) {
+                if (RB_TYPE_P(obj, T_STRUCT) && struct_hash_needs_no_guard_p(obj)) hval = rb_struct_hash(obj);
             }
             else if (RBASIC_CLASS(cme->defined_class) == rb_mKernel) {
                 hval = rb_vm_call0(GET_EC(), obj, id_hash, 0, 0, cme, 0);

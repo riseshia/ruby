@@ -18,6 +18,8 @@
 #include "internal/proc.h"
 #include "internal/struct.h"
 #include "internal/symbol.h"
+#include "internal/thread.h"
+#include "internal/vm.h"
 #include "shape.h"
 #include "vm_core.h"
 #include "builtin.h"
@@ -1591,6 +1593,27 @@ rb_struct_select(int argc, VALUE *argv, VALUE s)
     return result;
 }
 
+// Compares the members as far as that needs no method call: Qtrue, Qfalse, or
+// Qundef when a call would be needed. Without a call nothing can re-enter the
+// comparison, so the recursion guard has nothing to catch. It answers Qtrue
+// both for equal structs and for a pair that is already being compared, so
+// Qtrue stands as is; Qfalse only stands when no comparison is in progress
+// further up the stack, where the same pair would compare as Qtrue.
+static VALUE
+struct_equal_without_call(VALUE s, VALUE s2, VALUE (*opt_equal)(VALUE, VALUE))
+{
+    long len = RSTRUCT_LEN_RAW(s);
+    for (long i = 0; i < len; i++) {
+        VALUE v = RSTRUCT_GET_RAW(s, i), v2 = RSTRUCT_GET_RAW(s2, i);
+        if (v == v2) continue;
+
+        VALUE result = opt_equal(v, v2);
+        if (UNDEF_P(result)) return Qundef;
+        if (!RTEST(result)) return rb_exec_recursive_idle_p() ? Qfalse : Qundef;
+    }
+    return Qtrue;
+}
+
 static VALUE
 recursive_equal(VALUE s, VALUE s2, int recur)
 {
@@ -1635,6 +1658,9 @@ rb_struct_equal(VALUE s, VALUE s2)
         rb_bug("inconsistent struct"); /* should never happen */
     }
 
+    VALUE result = struct_equal_without_call(s, s2, rb_equal_opt);
+    if (!UNDEF_P(result)) return result;
+
     return rb_exec_recursive_paired(recursive_equal, s, s2, s2);
 }
 
@@ -1657,7 +1683,7 @@ rb_struct_equal(VALUE s, VALUE s2)
  *  Related: Object#hash.
  */
 
-static VALUE
+VALUE
 rb_struct_hash(VALUE s)
 {
     long i, len;
@@ -1715,6 +1741,9 @@ rb_struct_eql(VALUE s, VALUE s2)
     if (RSTRUCT_LEN_RAW(s) != RSTRUCT_LEN_RAW(s2)) {
         rb_bug("inconsistent struct"); /* should never happen */
     }
+
+    VALUE result = struct_equal_without_call(s, s2, rb_eql_opt);
+    if (!UNDEF_P(result)) return result;
 
     return rb_exec_recursive_paired(recursive_eql, s, s2, s2);
 }
