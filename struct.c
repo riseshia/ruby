@@ -18,7 +18,6 @@
 #include "internal/proc.h"
 #include "internal/struct.h"
 #include "internal/symbol.h"
-#include "internal/vm.h"
 #include "shape.h"
 #include "vm_core.h"
 #include "builtin.h"
@@ -1592,23 +1591,6 @@ rb_struct_select(int argc, VALUE *argv, VALUE s)
     return result;
 }
 
-// True only when every member pair is equal and deciding so needs no method
-// call. rb_exec_recursive_paired() answers Qtrue both for such a pair and for
-// a pair that is already being compared, so skipping it here cannot be
-// observed. An unequal pair still has to go through it: while the same pair
-// is being compared further up the stack the answer must stay Qtrue.
-static bool
-struct_members_equal_without_call_p(VALUE s, VALUE s2, VALUE (*opt_equal)(VALUE, VALUE))
-{
-    long len = RSTRUCT_LEN_RAW(s);
-    for (long i = 0; i < len; i++) {
-        VALUE v = RSTRUCT_GET_RAW(s, i), v2 = RSTRUCT_GET_RAW(s2, i);
-        if (v == v2) continue;
-        if (opt_equal(v, v2) != Qtrue) return false;
-    }
-    return true;
-}
-
 static VALUE
 recursive_equal(VALUE s, VALUE s2, int recur)
 {
@@ -1652,8 +1634,6 @@ rb_struct_equal(VALUE s, VALUE s2)
     if (RSTRUCT_LEN_RAW(s) != RSTRUCT_LEN_RAW(s2)) {
         rb_bug("inconsistent struct"); /* should never happen */
     }
-
-    if (struct_members_equal_without_call_p(s, s2, rb_equal_opt)) return Qtrue;
 
     return rb_exec_recursive_paired(recursive_equal, s, s2, s2);
 }
@@ -1735,8 +1715,6 @@ rb_struct_eql(VALUE s, VALUE s2)
     if (RSTRUCT_LEN_RAW(s) != RSTRUCT_LEN_RAW(s2)) {
         rb_bug("inconsistent struct"); /* should never happen */
     }
-
-    if (struct_members_equal_without_call_p(s, s2, rb_eql_opt)) return Qtrue;
 
     return rb_exec_recursive_paired(recursive_eql, s, s2, s2);
 }
