@@ -1151,6 +1151,16 @@ rb_struct_each_pair(VALUE s)
     return s;
 }
 
+// The result grows by a name, a value and punctuation per member; start with
+// room for that instead of growing out of an embedded String step by step.
+static VALUE
+inspect_struct_prefix(VALUE s, const char *prefix)
+{
+    VALUE str = rb_str_buf_new(32 + 16 * RSTRUCT_LEN_RAW(s));
+    rb_str_cat_cstr(str, prefix);
+    return str;
+}
+
 static VALUE
 inspect_struct(VALUE s, VALUE prefix, int recur)
 {
@@ -1212,7 +1222,7 @@ inspect_struct(VALUE s, VALUE prefix, int recur)
 static VALUE
 rb_struct_inspect(VALUE s)
 {
-    return rb_exec_recursive(inspect_struct, s, rb_str_new2("#<struct"));
+    return rb_exec_recursive(inspect_struct, s, inspect_struct_prefix(s, "#<struct"));
 }
 
 /*
@@ -2214,7 +2224,7 @@ rb_data_with(int argc, const VALUE *argv, VALUE self)
 static VALUE
 rb_data_inspect(VALUE s)
 {
-    return rb_exec_recursive(inspect_struct, s, rb_str_new2("#<data"));
+    return rb_exec_recursive(inspect_struct, s, inspect_struct_prefix(s, "#<data"));
 }
 
 /*
