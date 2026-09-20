@@ -15,6 +15,12 @@ class K2; def initialize(x:, y:) = (@x = x; @y = y); end
 class K5; def initialize(a:, b:, c:, d:, e:) = (@a = a; @b = b; @c = c; @d = d; @e = e); end
 S2 = Struct.new(:x, :y); S5 = Struct.new(:a, :b, :c, :d, :e)
 D2 = Data.define(:x, :y); D5 = Data.define(:a, :b, :c, :d, :e)
+class W5
+  attr_reader :a, :b, :c, :d, :e
+  def initialize(a, b, c, d, e) = (@a = a; @b = b; @c = c; @d = d; @e = e)
+  def with(a: @a, b: @b, c: @c, d: @d, e: @e) = W5.new(a, b, c, d, e)
+end
+W5_INSTANCE = W5.new(1, 2, 3, 4, 5); D5_INSTANCE = D5.new(1, 2, 3, 4, 5)
 
 CASES = {
   "new 2 members"  => ["C2.new(1, 2)", "S2.new(1, 2)", "D2.new(1, 2)"],
@@ -22,6 +28,8 @@ CASES = {
   "new 2 keywords" => ["K2.new(x: 1, y: 2)", "S2.new(x: 1, y: 2)", "D2.new(x: 1, y: 2)"],
   "new 5 keywords" => ["K5.new(a: 1, b: 2, c: 3, d: 4, e: 5)", "S5.new(a: 1, b: 2, c: 3, d: 4, e: 5)", "D5.new(a: 1, b: 2, c: 3, d: 4, e: 5)"],
   "[] 2 members"   => ["C2.new(1, 2)", "S2[1, 2]", "D2[1, 2]"],
+  "with(c: 9) of 5"  => ["W5_INSTANCE.with(c: 9)", nil, "D5_INSTANCE.with(c: 9)"],
+  "with(a:, e:) of 5" => ["W5_INSTANCE.with(a: 8, e: 9)", nil, "D5_INSTANCE.with(a: 8, e: 9)"],
 }
 
 if ARGV[0] == "--cell"
@@ -47,8 +55,8 @@ jit = if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled? then ["--yjit"]
       else [] end
 # An uninstalled build has no rbconfig to ask, so the binary is given explicitly
 ruby = ENV.fetch("BENCH_RUBY")
-puts format("%-16s %7s %7s %7s", "", "class", "Struct", "Data")
+puts format("%-18s %7s %7s %7s", "", "class", "Struct", "Data")
 CASES.each_with_index do |(label, codes), row|
-  cells = codes.each_index.map { |col| IO.popen([ruby, *jit, __FILE__, "--cell", row.to_s, col.to_s], err: File::NULL, &:read).to_f }
-  puts format("%-16s %s", label, cells.map { format("%7.1f", _1) }.join(" "))
+  cells = codes.each_index.map { |col| codes[col] && IO.popen([ruby, *jit, __FILE__, "--cell", row.to_s, col.to_s], err: File::NULL, &:read).to_f }
+  puts format("%-18s %s", label, cells.map { _1 ? format("%7.1f", _1) : format("%7s", "-") }.join(" "))
 end

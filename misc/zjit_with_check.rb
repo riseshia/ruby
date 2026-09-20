@@ -40,3 +40,14 @@ def update(d) = d.with(y: 0)
 3000.times { update(Late.new(1, 2)) }
 Late.class_eval { def initialize(x:, y:) = super(x:, y: y + 100) }
 puts "after initialize is defined: #{update(Late.new(1, 2)).to_h}"
+
+Traced = Data.define(:x, :y)
+def traced_update(d) = d.with(y: 0)
+3000.times { traced_update(Traced.new(1, 2)) }
+events = []
+instance = Traced.new(1, 2)
+TracePoint.new(:c_call, :c_return) { |tp| events << [tp.event, tp.method_id] }.enable { traced_update(instance) }
+puts "c_call / c_return while traced: #{events.inspect}"
+puts "after tracing: #{traced_update(instance).to_h}"
+frozen_error = begin; traced_update(instance).instance_variable_set(:@a, 1); rescue => e; e.class; end
+puts "copy is frozen: #{frozen_error}"
