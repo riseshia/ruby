@@ -197,6 +197,20 @@ trace_events("overridden initialize traced") { Validates.new(1, 2) }
 allocation_info("overridden initialize allocation, positional") { Validates.new(1, 2) }
 allocation_info("overridden initialize allocation, keywords") { Validates.new(x: 1, y: 2) }
 
+section "inspect"
+Odd = Struct.new(:"a b", :Const, :_under, :"é")
+report("named struct") { [Point.new(1, "two").inspect, Point.new(1, 2).to_s] }
+report("anonymous struct and data") { [Struct.new(:a).new(1).inspect, Data.define(:a).new(1).inspect] }
+report("member names that need quoting") { Odd.new(1, 2, 3, 4).inspect }
+report("nested") { Point.new(Coord.new(1, [2, {k: Point.new(nil, :sym)}]), 2.5).inspect }
+report("recursive") { s = Point.new(1, nil); s.y = s; [s.inspect, Struct.new(:me).new.tap { _1.me = _1 }.inspect.gsub(/0x\h+/, "0x…")] }
+report("recursive through an Array") { s = Point.new(1, []); s.y << s; s.inspect }
+report("encodings") { [Point.new("é", "\xff".b).inspect, Point.new("é".encode("UTF-16LE"), 1).inspect.encoding] }
+report("many members") { s = BigCoord.new(*1..12).inspect; [s.size, s[0, 30], s[-12..]] }
+report("200 members") { s = Wide.new(*1..200).inspect; [s.size, s[-20..]] }
+report("member with its own inspect") { o = Object.new; def o.inspect = "<custom>"; Point.new(o, o).inspect }
+report("result is a new unfrozen String") { a = Point.new(1, 2); [a.inspect.frozen?, a.inspect.equal?(a.inspect), a.inspect.encoding] }
+
 section "initialize called again"
 report("unfrozen struct, fewer args") { Point.new(1, 2).tap { _1.send(:initialize, 9) } }
 report("unfrozen struct, no args") { Point.new(1, 2).tap { _1.send(:initialize) } }
