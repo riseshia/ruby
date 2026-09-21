@@ -21,6 +21,11 @@ CASES = {
   "Array#include? (10, miss)" => ["Array.new(10) { |i| K.new(i, 2, 3) }", "K.new(99, 2, 3)", "a.include?(b)"],
 }
 if ARGV[0] == "--cell"
+  # A process that has ever inspected or compared a container has the recursion guard tables
+  # set up, which makes looking the guard up dearer. PREWARM=1 measures that state.
+  if ENV["PREWARM"]
+    r = Struct.new(:a).new(nil); r.a = [r]; r.inspect; r == r.dup; r.hash; r.eql?(r.dup)
+  end
   K = KLASSES[ARGV[2].to_i]
   setup = CASES.values[ARGV[1].to_i]
   A = eval(setup[0]); B = eval(setup[1])
