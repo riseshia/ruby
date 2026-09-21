@@ -26,6 +26,8 @@ values = {
   "mixed" => S.new(1, [2], {a: 3}), "data" => D.new(1, "two"), "data symbols" => D.new(:a, nil),
   "anonymous" => Struct.new(:a).new(1), "anonymous data" => Data.define(:a).new("x"), "empty" => Struct.new("EmptyProbe").new,
   "non-ascii member" => Jp.new("n", 1), "odd members" => Odd.new(1, "2", nil, true), "recursive" => rec, "nested" => nested,
+  "symbols" => S.new(:a, :"foo bar", :"9x"), "non-ascii symbol" => S.new(:"名前", "\x82\xa0".dup.force_encoding("Shift_JIS").to_sym, :"quote\"d"),
+  "floats" => S.new(1.5, -0.0, 1e100), "special floats" => S.new(Float::NAN, Float::INFINITY, 2.0**70), "bignum" => S.new(2**64, -(2**80), 10**30),
   "keyword_init" => Struct.new(:a, keyword_init: true).new(a: 1),
 }
 values.each { |label, obj| show(label, obj) }
@@ -38,7 +40,7 @@ values.each { |label, obj| show(label, obj) }
     $VERBOSE = verbose
   end
   puts "-- default_external=#{ext} default_internal=#{int.inspect}"
-  %w[ints strings binary sjis non-ascii\ member data].each { |label| show(label, values.fetch(label)) }
+  ["ints", "strings", "binary", "sjis", "non-ascii member", "data", "symbols", "non-ascii symbol", "floats", "bignum"].each { |label| show(label, values.fetch(label)) }
 rescue => e
   puts "-- #{ext}/#{int.inspect}: #{e.class}: #{e.message}"
 end
@@ -61,6 +63,16 @@ class Integer; alias_method :inspect, :__inspect; end
 class String; alias_method :__inspect, :inspect; def inspect = "STR"; end
 show("String#inspect redefined", S.new(12, "s", nil))
 class String; alias_method :inspect, :__inspect; end
+class Symbol; alias_method :__inspect, :inspect; def inspect = "SYM"; end
+show("Symbol#inspect redefined", S.new(:a, 1.5, 2**64))
+class Symbol; alias_method :inspect, :__inspect; end
+class Float; def inspect = "FLO"; end
+show("Float#inspect redefined", S.new(:a, 1.5, 2**64))
+class Float; remove_method :inspect; end
+show("Float#inspect restored", S.new(:a, 1.5, 2**64))
+class Integer; def to_s(*) = "TO_S"; end
+show("Integer#to_s redefined (inspect is an alias entry of its own)", S.new(12, 1.5, 2**64))
+class Integer; remove_method :to_s; end
 class NilClass; def inspect = "NIL"; end
 show("NilClass#inspect redefined", S.new(12, "s", nil))
 class NilClass; def inspect = "nil"; end
