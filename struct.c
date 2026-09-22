@@ -2292,6 +2292,23 @@ rb_struct_eql(VALUE s, VALUE s2)
     return rb_exec_recursive_paired(recursive_eql, s, s2, s2);
 }
 
+// eql? of +s+ and +s2+ for a Hash matching +s+ against a key: Qtrue or Qfalse when the
+// Struct#eql? +s+ has settles it without calling a method, Qundef when it is not that
+// method, or would call one, or a TracePoint is watching C calls. The Hash then calls
+// eql? as it did, with its frame.
+VALUE
+rb_struct_eql_without_call(VALUE s, VALUE s2)
+{
+    if (ruby_vm_c_events_enabled > 0) return Qundef;
+    const rb_callable_method_entry_t *cme = rb_callable_method_entry(CLASS_OF(s), idEqlP);
+    if (!cme || cme->def->type != VM_METHOD_TYPE_CFUNC || cme->def->body.cfunc.func != (rb_cfunc_t)rb_struct_eql) {
+        return Qundef;
+    }
+    if (!RB_TYPE_P(s2, T_STRUCT)) return Qfalse;
+    if (RBASIC_CLASS(s) != RBASIC_CLASS(s2) && rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
+    return struct_equal_without_call(s, s2, rb_eql_opt);
+}
+
 /*
  *  call-seq:
  *    size -> integer

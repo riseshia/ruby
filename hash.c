@@ -149,6 +149,10 @@ rb_any_cmp(VALUE a, VALUE b)
     if (SYMBOL_P(a) && SYMBOL_P(b)) {
         return a != b;
     }
+    if (RB_TYPE_P(a, T_STRUCT)) {
+        VALUE result = rb_struct_eql_without_call(a, b);
+        if (!UNDEF_P(result)) return !RTEST(result);
+    }
 
     return !rb_eql(a, b);
 }
