@@ -12,15 +12,22 @@ class Plain
   def inspect = "#<struct Plain x=#{@x.inspect}, y=#{@y.inspect}, z=#{@z.inspect}>"
   def with(**kw) = self.class.new(kw.fetch(:x, @x), kw.fetch(:y, @y), kw.fetch(:z, @z))
 end
-KLASS = { "class" => Plain, "struct" => Struct.new(:x, :y, :z), "data" => Data.define(:x, :y, :z) }.fetch(ARGV.fetch(1))
+class SubS < Struct.new(:x, :y, :z); end
+class SubD < Data.define(:x, :y, :z); end
+class SubSub < SubS; end
+KLASS = { "class" => Plain, "struct" => Struct.new(:x, :y, :z), "data" => Data.define(:x, :y, :z), "substruct" => SubS, "subdata" => SubD, "subsub" => SubSub }.fetch(ARGV.fetch(1))
 OPS = {
   "dup" => "o.dup.x", "clone" => "o.clone.x", "inspect" => "o.inspect.size", "to_s" => "o.to_s.size",
   "each" => "t = 0; o.each { |v| t += v }; t", "each_pair" => "t = 0; o.each_pair { |k, v| t += v }; t",
   "values_at" => "o.values_at(0, 2).size", "dig" => "o.dig(:x)", "sum_to_a" => "o.to_a.sum", "hash" => "o.hash",
   "frozen?" => "o.frozen? ? 1 : 2", "respond_to" => "o.respond_to?(:x) ? 1 : 2", "reader" => "o.x + o.y + o.z",
-  "eq_self" => "o == o ? 1 : 2", "new_with_hash" => "KLASS.new(**H).x", "members_size" => "o.members.size",
+  "eq_self" => "o == o ? 1 : 2", "new_with_hash" => "KLASS.new(**H).x", "members_size" => "o.members.size", "new_splat" => "KLASS.new(*A).x", "with_hash" => "o.with(**W).y", "with_lit" => "o.with(y: 5).y", "new_lit_kw" => "KLASS.new(x: 1, y: 2, z: 3).x", "new_pos" => "KLASS.new(1, 2, 3).x", "marshal_rt" => "Marshal.load(Marshal.dump(o)).x", "setter" => "o.x = i", "eq_other" => "o == O2 ? 1 : 2",
 }
 H = { x: 1, y: 2, z: 3 }
+A = [1, 2, 3]
+W = { y: 5 }
+class Plain; attr_writer :x; def ==(o) = o.class == self.class && o.x == @x && o.y == @y && o.z == @z; end
+O2 = KLASS.new(1, 2, 3)
 op = OPS.fetch(ARGV.fetch(0))
 eval "def run(o, n) = (i = 0; r = 0; while i < n; r = (#{op}); i += 1; end; r)"
 o = KLASS.new(1, 2, 3)
