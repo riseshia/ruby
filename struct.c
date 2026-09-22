@@ -2864,9 +2864,16 @@ VALUE
 rb_data_with(int argc, const VALUE *argv, VALUE self)
 {
     VALUE kwargs;
-    rb_scan_args(argc, argv, "0:", &kwargs);
-    if (NIL_P(kwargs)) {
-        return self;
+    if (argc == 1 && rb_keyword_given_p()) {
+        // What rb_scan_args(argc, argv, "0:", &kwargs) settles on, without the copy it makes
+        // of the Hash: it is only read from here on.
+        kwargs = argv[0];
+    }
+    else {
+        rb_scan_args(argc, argv, "0:", &kwargs);
+        if (NIL_P(kwargs)) {
+            return self;
+        }
     }
 
     // The regular path hands a block on to to_h, which then wants pairs from it
