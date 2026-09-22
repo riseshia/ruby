@@ -422,7 +422,11 @@ keyword_positions_i(st_data_t key, st_data_t val, st_data_t ptr)
 static bool
 resolve_keyword_positions(VALUE klass, long len, VALUE hash, struct keyword_positions *kw)
 {
-    *kw = (struct keyword_positions){ .back_members = struct_ivar_get(klass, id_back_members), .len = len };
+    // Only the header: the arrays are filled up to count, and a compound literal
+    // would clear all of them (some 800 bytes) on every call.
+    kw->back_members = struct_ivar_get(klass, id_back_members);
+    kw->len = len;
+    kw->count = 0;
     // An inconsistent class is left to the regular path, which raises for it.
     if (!struct_back_members_usable_p(kw->back_members, len)) return false;
 
