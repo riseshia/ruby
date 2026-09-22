@@ -15,6 +15,7 @@
 VALUE rb_class_allocate_instance(VALUE klass);
 VALUE rb_class_allocate_instance_capa(VALUE klass, uint8_t /* attr_index_t */ max_iv_count);
 VALUE rb_class_search_ancestor(VALUE klass, VALUE super);
+VALUE rb_inspect_result(VALUE str);
 NORETURN(void rb_undefined_alloc(VALUE klass));
 double rb_num_to_dbl(VALUE val);
 VALUE rb_obj_dig(int argc, VALUE *argv, VALUE self, VALUE notfound);

@@ -1108,6 +1108,8 @@ struct rb_execution_context_struct {
     struct rb_id_table *local_storage;
     VALUE local_storage_recursive_hash;
     VALUE local_storage_recursive_hash_for_trace;
+    /* how many rb_exec_recursive*() guards are in place: entries in the two hashes above */
+    unsigned int recursive_guard_depth;
 
     /* Inheritable fiber storage. */
     VALUE storage;
@@ -2091,6 +2093,9 @@ VALUE rb_vm_call_kw(rb_execution_context_t *ec, VALUE recv, VALUE id, int argc,
                  const VALUE *argv, const rb_callable_method_entry_t *me, int kw_splat);
 void rb_vm_pop_frame_no_int(rb_execution_context_t *ec);
 void rb_vm_pop_frame(rb_execution_context_t *ec);
+const VALUE *rb_vm_data_new_trampoline(void);
+bool rb_vm_data_new_trampoline_frame_p(const rb_control_frame_t *cfp);
+VALUE rb_vm_data_new_trampoline_finish(rb_execution_context_t *ec);
 
 void rb_thread_start_timer_thread(void);
 void rb_thread_stop_timer_thread(void);

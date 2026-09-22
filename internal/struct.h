@@ -47,6 +47,24 @@ struct RStruct {
 VALUE rb_struct_init_copy(VALUE copy, VALUE s);
 VALUE rb_struct_lookup(VALUE s, VALUE idx);
 VALUE rb_struct_hash(VALUE s);
+VALUE rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self);
+VALUE rb_struct_new_without_frame(VALUE klass, int argc, const VALUE *argv);
+bool rb_struct_alloc_class_p(VALUE klass);
+bool rb_struct_initialize_positional_without_frame(VALUE self, int argc, const VALUE *argv);
+bool rb_struct_initialize_without_frame(VALUE self, int argc, const VALUE *argv, int keyword_len, const VALUE *keywords);
+VALUE rb_data_s_new(int argc, const VALUE *argv, VALUE klass);
+VALUE rb_data_with(int argc, const VALUE *argv, VALUE self);
+VALUE rb_data_initialize_m(int argc, const VALUE *argv, VALUE self);
+bool rb_data_initialize_without_frame(VALUE self, int argc, const VALUE *argv, const VALUE *keywords);
+VALUE rb_data_with_without_frame(VALUE self, int argc, const VALUE *argv, const VALUE *keywords);
+const VALUE *rb_data_positional_keywords(VALUE klass, int argc);
+VALUE rb_data_new_without_frame(VALUE klass, int argc, const VALUE *argv, int keyword_len, const VALUE *keywords);
+VALUE rb_data_new_kw_splat_without_frame(VALUE klass, VALUE hash);
+VALUE rb_data_with_kw_splat_without_frame(VALUE self, VALUE hash);
+VALUE rb_struct_initialize_splat_without_frame(VALUE self, VALUE ary);
+VALUE rb_data_new_splat_without_frame(VALUE klass, VALUE ary);
+bool rb_struct_initialize_kw_splat_without_frame(VALUE self, VALUE hash);
+bool rb_data_initialize_kw_splat_without_frame(VALUE self, VALUE hash);
 VALUE rb_struct_s_keyword_init(VALUE klass);
 void rb_struct_define_aref_method(VALUE nstr, ID name, unsigned int off);
 

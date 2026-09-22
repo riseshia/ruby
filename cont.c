@@ -1665,6 +1665,7 @@ cont_init(rb_context_t *cont, rb_thread_t *th)
     cont->saved_ec.local_storage = NULL;
     cont->saved_ec.local_storage_recursive_hash = Qnil;
     cont->saved_ec.local_storage_recursive_hash_for_trace = Qnil;
+    cont->saved_ec.recursive_guard_depth = 0;
     cont_init_jit_cont(cont);
 }
 
@@ -2552,6 +2553,7 @@ fiber_prepare_stack(rb_fiber_t *fiber)
     sec->local_storage = NULL;
     sec->local_storage_recursive_hash = Qnil;
     sec->local_storage_recursive_hash_for_trace = Qnil;
+    sec->recursive_guard_depth = 0;
 }
 
 static struct fiber_pool *

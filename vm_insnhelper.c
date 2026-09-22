@@ -4035,13 +4035,407 @@ vm_call_cfunc_only_splat_kw(rb_execution_context_t *ec, rb_control_frame_t *reg_
     return vm_call_cfunc_other(ec, reg_cfp, calling);
 }
 
+// Struct#initialize without pushing a frame. The method entry stays the C function,
+// so reflection and the backtrace of an error are unchanged: whenever the call could
+// raise, or a hook wants its c_call / c_return, the regular call is made. Literal
+// keyword names are read from the call site instead of from a Hash built for them.
+static VALUE
+vm_call_struct_initialize(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    const struct rb_callinfo_kwarg *kwarg = vm_ci_kwarg(calling->cd->ci);
+    int argc = calling->argc;
+    const VALUE *argv = reg_cfp->sp - argc;
+
+    if (ruby_vm_c_events_enabled == 0 &&
+        rb_struct_initialize_without_frame(calling->recv, argc, argv, kwarg ? kwarg->keyword_len : 0, kwarg ? kwarg->keywords : NULL)) {
+        reg_cfp->sp -= argc + 1;
+        return Qnil;
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+// vm_call_struct_initialize() for a call site without keywords whose call cache is for a
+// class that is not keyword_init: true. A call cache serves one class and keyword_init is
+// fixed when Struct.new makes the class, so that is not looked up again.
+static VALUE
+vm_call_struct_initialize_positional(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    int argc = calling->argc;
+
+    if (ruby_vm_c_events_enabled == 0 &&
+        rb_struct_initialize_positional_without_frame(calling->recv, argc, reg_cfp->sp - argc)) {
+        reg_cfp->sp -= argc + 1;
+        return Qnil;
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+// Class#new reached by a regular call (`Point[1, 2]`, send(:new)) on a Struct class;
+// see rb_struct_new_without_frame()
+static VALUE
+vm_call_struct_s_new(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    int argc = calling->argc;
+
+    if (calling->block_handler == VM_BLOCK_HANDLER_NONE) {
+        VALUE obj = rb_struct_new_without_frame(calling->recv, argc, reg_cfp->sp - argc);
+        if (!UNDEF_P(obj)) {
+            reg_cfp->sp -= argc + 1;
+            return obj;
+        }
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+// Data#initialize without pushing a frame; see vm_call_struct_initialize()
+static VALUE
+vm_call_data_initialize(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    const struct rb_callinfo_kwarg *kwarg = vm_ci_kwarg(calling->cd->ci);
+    int argc = calling->argc;
+    const VALUE *argv = reg_cfp->sp - argc;
+
+    if (ruby_vm_c_events_enabled == 0 && kwarg && kwarg->keyword_len == argc &&
+        rb_data_initialize_without_frame(calling->recv, argc, argv, kwarg->keywords)) {
+        reg_cfp->sp -= argc + 1;
+        return Qnil;
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+static VALUE vm_call0_iseq_with_kwarg(rb_execution_context_t *ec, VALUE recv, ID id, int argc, const VALUE *argv,
+                                      const struct rb_callinfo_kwarg *kwarg, const rb_callable_method_entry_t *cme);
+
+// A C frame that a method written in Ruby returns into.
+//
+// Data.new has to call an initialize written in Ruby with its own frame in place: that
+// frame shows in a backtrace taken inside initialize. Calling initialize from C means a
+// nested vm_exec() and, for a JIT, a trip through C that it cannot see into. Instead the
+// frame of new is given a pc: one instruction, the one a built-in method written in
+// Ruby ends with, which calls a C function and leaves with its value. That function
+// returns the instance, kept in block_code (which a C frame without a block has no use
+// for and the GC marks). The interpreter pushes that frame and the
+// frame of initialize and carries on in the same loop; a JIT can do the same and call
+// initialize as it would from Ruby code. Whoever runs `leave` for initialize, or unwinds
+// through it, lands in a frame that knows how to finish.
+static VALUE data_new_trampoline[3]; // opt_invokebuiltin_delegate_leave <the function below>, 0
+
+// What the C function would do on its way out: c_return, then its value
+static VALUE
+data_new_trampoline_return(rb_execution_context_t *ec, VALUE self)
+{
+    rb_control_frame_t *cfp = ec->cfp;
+    VALUE obj = (VALUE)cfp->block_code;
+    const rb_callable_method_entry_t *me = rb_vm_frame_method_entry(cfp);
+
+    EXEC_EVENT_HOOK(ec, RUBY_EVENT_C_RETURN, self, me->def->original_id, me->called_id, me->owner, obj);
+    RUBY_DTRACE_CMETHOD_RETURN_HOOK(ec, me->owner, me->def->original_id);
+    return obj;
+}
+
+const VALUE *
+rb_vm_data_new_trampoline(void)
+{
+    static const struct rb_builtin_function bf = RB_BUILTIN_FUNCTION(-1, data_new_trampoline_return, data_new_trampoline_return, 0);
+
+    if (!data_new_trampoline[0]) {
+        data_new_trampoline[2] = 0;
+        data_new_trampoline[1] = (VALUE)&bf;
+#if OPT_DIRECT_THREADED_CODE || OPT_CALL_THREADED_CODE
+        data_new_trampoline[0] = (VALUE)rb_vm_get_insns_address_table()[BIN(opt_invokebuiltin_delegate_leave)];
+#else
+        data_new_trampoline[0] = BIN(opt_invokebuiltin_delegate_leave);
+#endif
+    }
+    return data_new_trampoline;
+}
+
+bool
+rb_vm_data_new_trampoline_frame_p(const rb_control_frame_t *cfp)
+{
+    return cfp->pc >= data_new_trampoline && cfp->pc < data_new_trampoline + numberof(data_new_trampoline) && CFP_ISEQ(cfp) == NULL;
+}
+
+// For C code that ran the method on top of a trampoline frame to its end itself (a nested
+// vm_exec(), JIT code called from C): pops the frame of new and returns the instance.
+VALUE
+rb_vm_data_new_trampoline_finish(rb_execution_context_t *ec)
+{
+    VALUE obj = data_new_trampoline_return(ec, ec->cfp->self);
+    rb_vm_pop_frame(ec);
+    return obj;
+}
+
+// Data.new for a class whose initialize is written in Ruby: push the frame of `new`, then
+// the frame of initialize with the keywords of the call site as they are (or, for
+// positional arguments, under the member names, which is what Data.new turns them into)
+// instead of a Hash to splat. Returns Qundef with both frames pushed, as a call of a
+// method written in Ruby does; Qnil, with nothing done, when the regular call has to deal
+// with the arguments.
+static VALUE
+vm_call_data_new_with_iseq_initialize(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling,
+                                      const rb_callable_method_entry_t *initialize)
+{
+    const struct rb_callinfo_kwarg *kwarg = vm_ci_kwarg(calling->cd->ci);
+    const rb_callable_method_entry_t *me = vm_cc_cme(calling->cc);
+    VALUE klass = calling->recv;
+    int argc = calling->argc;
+    VALUE *argv = reg_cfp->sp - argc;
+
+    if (argc == 0) return Qnil;
+    if (kwarg) {
+        if (kwarg->keyword_len != argc) return Qnil;
+    }
+    else {
+        const VALUE *names = rb_data_positional_keywords(klass, argc);
+        if (!names) return Qnil;
+
+        struct rb_callinfo_kwarg *positional = ALLOCA_N(struct rb_callinfo_kwarg, 1 + rb_callinfo_kwarg_bytes(argc) / sizeof(struct rb_callinfo_kwarg));
+        positional->keyword_len = argc;
+        positional->references = 0;
+        MEMCPY(positional->keywords, names, VALUE, argc);
+        kwarg = positional;
+    }
+
+    RUBY_DTRACE_CMETHOD_ENTRY_HOOK(ec, me->owner, me->def->original_id);
+    vm_push_frame(ec, NULL, VM_FRAME_MAGIC_CFUNC | VM_FRAME_FLAG_CFRAME | VM_ENV_FLAG_LOCAL | (vm_ci_kwarg(calling->cd->ci) ? VM_FRAME_FLAG_CFRAME_KW : 0),
+                  klass, VM_BLOCK_HANDLER_NONE, (VALUE)me, rb_vm_data_new_trampoline(), reg_cfp->sp, 0, 0);
+    reg_cfp->sp = argv - 1;
+
+    // The frame of new keeps the instance for the trampoline. Its environment sits right
+    // above the arguments, so initialize gets its receiver and arguments above that.
+    VALUE obj = rb_obj_alloc(klass);
+    rb_control_frame_t *new_cfp = ec->cfp;
+    new_cfp->block_code = (void *)obj;
+
+    CHECK_VM_STACK_OVERFLOW(new_cfp, argc + 1);
+    *new_cfp->sp++ = obj;
+    for (int i = 0; i < argc; i++) {
+        *new_cfp->sp++ = argv[i];
+    }
+    const struct rb_callcache cc = VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, initialize);
+    struct rb_calling_info initialize_calling = {
+        .cd = &(struct rb_call_data) {
+            .ci = &VM_CI_ON_STACK(idInitialize, VM_CALL_KWARG | VM_CALL_FCALL, argc, kwarg),
+            .cc = NULL,
+        },
+        .cc = &cc,
+        .block_handler = VM_BLOCK_HANDLER_NONE,
+        .recv = obj,
+        .argc = argc,
+        .kw_splat = 0,
+    };
+    const rb_iseq_t *iseq = def_iseq_ptr(initialize->def);
+    if (rb_iseq_only_kwparam_p(iseq) && ISEQ_BODY(iseq)->param.lead_num == 0) {
+        // The usual shape, `def initialize(x:, y: 0)`: what a call site with a call cache
+        // would have settled on
+        vm_call_iseq_setup_kwparm_kwarg(ec, new_cfp, &initialize_calling);
+    }
+    else {
+        vm_call_iseq_setup(ec, new_cfp, &initialize_calling);
+    }
+    return Qundef;
+}
+
+// Data.new without pushing a frame, or with the frame but without the Hash; see
+// vm_call_struct_initialize(). initialize is looked up once for both.
+static VALUE
+vm_call_data_new(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    const struct rb_callinfo_kwarg *kwarg = vm_ci_kwarg(calling->cd->ci);
+    int argc = calling->argc;
+    const VALUE *argv = reg_cfp->sp - argc;
+
+    if (calling->block_handler == VM_BLOCK_HANDLER_NONE && ruby_vm_c_events_enabled == 0 && RB_TYPE_P(calling->recv, T_CLASS)) {
+        const rb_callable_method_entry_t *initialize = rb_callable_method_entry(calling->recv, idInitialize);
+        VALUE obj = Qundef;
+
+        if (initialize && initialize->def->type == VM_METHOD_TYPE_CFUNC && initialize->def->body.cfunc.func == (rb_cfunc_t)rb_data_initialize_m) {
+            obj = rb_data_new_without_frame(calling->recv, argc, argv, kwarg ? kwarg->keyword_len : 0, kwarg ? kwarg->keywords : NULL);
+            if (!UNDEF_P(obj)) reg_cfp->sp -= argc + 1;
+        }
+        else if (initialize && initialize->def->type == VM_METHOD_TYPE_ISEQ) {
+            if (UNDEF_P(vm_call_data_new_with_iseq_initialize(ec, reg_cfp, calling, initialize))) return Qundef;
+        }
+        if (!UNDEF_P(obj)) return obj;
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+// Data#with without pushing a frame; see vm_call_struct_initialize()
+static VALUE
+vm_call_data_with(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    const struct rb_callinfo_kwarg *kwarg = vm_ci_kwarg(calling->cd->ci);
+    int argc = calling->argc;
+    const VALUE *argv = reg_cfp->sp - argc;
+
+    if (kwarg && kwarg->keyword_len == argc && calling->block_handler == VM_BLOCK_HANDLER_NONE) {
+        VALUE copy = rb_data_with_without_frame(calling->recv, argc, argv, kwarg->keywords);
+        if (!UNDEF_P(copy)) {
+            reg_cfp->sp -= argc + 1;
+            return copy;
+        }
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+// `Point.new(**hash)`, where the Hash is the only argument. The regular call copies it for
+// the C function to own; these read it where it is. See vm_call_struct_initialize().
+static VALUE
+vm_call_data_new_kw_splat(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    VALUE hash = reg_cfp->sp[-1];
+
+    if (calling->block_handler == VM_BLOCK_HANDLER_NONE && RB_TYPE_P(calling->recv, T_CLASS) &&
+        RB_TYPE_P(hash, T_HASH) && !RHASH_EMPTY_P(hash)) {
+        VALUE obj = rb_data_new_kw_splat_without_frame(calling->recv, hash);
+        if (!UNDEF_P(obj)) {
+            reg_cfp->sp -= 2;
+            return obj;
+        }
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+static VALUE
+vm_call_data_initialize_kw_splat(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    VALUE hash = reg_cfp->sp[-1];
+
+    if (ruby_vm_c_events_enabled == 0 && RB_TYPE_P(hash, T_HASH) && !RHASH_EMPTY_P(hash) &&
+        rb_data_initialize_kw_splat_without_frame(calling->recv, hash)) {
+        reg_cfp->sp -= 2;
+        return Qnil;
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+static VALUE
+vm_call_data_with_kw_splat(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    VALUE hash = reg_cfp->sp[-1];
+
+    if (calling->block_handler == VM_BLOCK_HANDLER_NONE && ruby_vm_c_events_enabled == 0 &&
+        RB_TYPE_P(hash, T_HASH) && !RHASH_EMPTY_P(hash)) {
+        VALUE copy = rb_data_with_kw_splat_without_frame(calling->recv, hash);
+        if (!UNDEF_P(copy)) {
+            reg_cfp->sp -= 2;
+            return copy;
+        }
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+static VALUE
+vm_call_struct_initialize_kw_splat(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    VALUE hash = reg_cfp->sp[-1];
+
+    if (ruby_vm_c_events_enabled == 0 && RB_TYPE_P(hash, T_HASH) && !RHASH_EMPTY_P(hash) &&
+        rb_struct_initialize_kw_splat_without_frame(calling->recv, hash)) {
+        reg_cfp->sp -= 2;
+        return Qnil;
+    }
+    return vm_call_cfunc_other(ec, reg_cfp, calling);
+}
+
+// `Point.new(*row)`, where the Array is the only argument: its elements are taken where
+// they are instead of being spread on the stack for a call with a frame.
+static VALUE
+vm_call_struct_initialize_splat(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    VALUE ary = reg_cfp->sp[-1];
+
+    if (ruby_vm_c_events_enabled == 0 && !UNDEF_P(rb_struct_initialize_splat_without_frame(calling->recv, ary))) {
+        reg_cfp->sp -= 2;
+        return Qnil;
+    }
+    return vm_call_cfunc_only_splat(ec, reg_cfp, calling);
+}
+
+static VALUE
+vm_call_data_new_splat(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
+{
+    VALUE ary = reg_cfp->sp[-1];
+
+    if (calling->block_handler == VM_BLOCK_HANDLER_NONE) {
+        VALUE obj = rb_data_new_splat_without_frame(calling->recv, ary);
+        if (!UNDEF_P(obj)) {
+            reg_cfp->sp -= 2;
+            return obj;
+        }
+    }
+    return vm_call_cfunc_only_splat(ec, reg_cfp, calling);
+}
+
 static VALUE
 vm_call_cfunc(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling)
 {
     const struct rb_callinfo *ci = calling->cd->ci;
     RB_DEBUG_COUNTER_INC(ccf_cfunc);
 
+    if (!IS_ARGS_SPLAT(ci) && !IS_ARGS_KW_SPLAT(ci) && !(vm_ci_flag(ci) & (VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING))) {
+        rb_cfunc_t func = vm_cc_cme(calling->cc)->def->body.cfunc.func;
+        if (func == (rb_cfunc_t)rb_struct_initialize_m) {
+            if (!vm_ci_kwarg(ci) && RB_TYPE_P(calling->recv, T_STRUCT) && !RTEST(rb_struct_s_keyword_init(rb_obj_class(calling->recv)))) {
+                CC_SET_FASTPATH(calling->cc, vm_call_struct_initialize_positional, TRUE);
+                return vm_call_struct_initialize_positional(ec, reg_cfp, calling);
+            }
+            CC_SET_FASTPATH(calling->cc, vm_call_struct_initialize, TRUE);
+            return vm_call_struct_initialize(ec, reg_cfp, calling);
+        }
+        if (func == (rb_cfunc_t)rb_class_new_instance_pass_kw && !vm_ci_kwarg(ci) && rb_struct_alloc_class_p(calling->recv)) {
+            CC_SET_FASTPATH(calling->cc, vm_call_struct_s_new, TRUE);
+            return vm_call_struct_s_new(ec, reg_cfp, calling);
+        }
+        if (func == (rb_cfunc_t)rb_data_initialize_m) {
+            CC_SET_FASTPATH(calling->cc, vm_call_data_initialize, TRUE);
+            return vm_call_data_initialize(ec, reg_cfp, calling);
+        }
+        if (func == (rb_cfunc_t)rb_data_with) {
+            CC_SET_FASTPATH(calling->cc, vm_call_data_with, TRUE);
+            return vm_call_data_with(ec, reg_cfp, calling);
+        }
+        if (func == (rb_cfunc_t)rb_data_s_new) {
+            CC_SET_FASTPATH(calling->cc, vm_call_data_new, TRUE);
+            return vm_call_data_new(ec, reg_cfp, calling);
+        }
+    }
+
+    if (!IS_ARGS_SPLAT(ci) && IS_ARGS_KW_SPLAT(ci) && vm_ci_argc(ci) == 1 && !(vm_ci_flag(ci) & (VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING))) {
+        // f(**h)
+        rb_cfunc_t func = vm_cc_cme(calling->cc)->def->body.cfunc.func;
+        if (func == (rb_cfunc_t)rb_data_s_new) {
+            CC_SET_FASTPATH(calling->cc, vm_call_data_new_kw_splat, TRUE);
+            return vm_call_data_new_kw_splat(ec, reg_cfp, calling);
+        }
+        if (func == (rb_cfunc_t)rb_struct_initialize_m) {
+            CC_SET_FASTPATH(calling->cc, vm_call_struct_initialize_kw_splat, TRUE);
+            return vm_call_struct_initialize_kw_splat(ec, reg_cfp, calling);
+        }
+        if (func == (rb_cfunc_t)rb_data_with) {
+            CC_SET_FASTPATH(calling->cc, vm_call_data_with_kw_splat, TRUE);
+            return vm_call_data_with_kw_splat(ec, reg_cfp, calling);
+        }
+        if (func == (rb_cfunc_t)rb_data_initialize_m) {
+            CC_SET_FASTPATH(calling->cc, vm_call_data_initialize_kw_splat, TRUE);
+            return vm_call_data_initialize_kw_splat(ec, reg_cfp, calling);
+        }
+    }
+
     if (IS_ARGS_SPLAT(ci) && !(vm_ci_flag(ci) & VM_CALL_FORWARDING)) {
+        if (!IS_ARGS_KW_SPLAT(ci) && vm_ci_argc(ci) == 1 && !(vm_ci_flag(ci) & VM_CALL_ARGS_BLOCKARG)) {
+            rb_cfunc_t func = vm_cc_cme(calling->cc)->def->body.cfunc.func;
+            if (func == (rb_cfunc_t)rb_struct_initialize_m) {
+                CC_SET_FASTPATH(calling->cc, vm_call_struct_initialize_splat, TRUE);
+                return vm_call_struct_initialize_splat(ec, reg_cfp, calling);
+            }
+            if (func == (rb_cfunc_t)rb_data_s_new) {
+                CC_SET_FASTPATH(calling->cc, vm_call_data_new_splat, TRUE);
+                return vm_call_data_new_splat(ec, reg_cfp, calling);
+            }
+        }
         if (!IS_ARGS_KW_SPLAT(ci) && vm_ci_argc(ci) == 1) {
             // f(*a)
             CC_SET_FASTPATH(calling->cc, vm_call_cfunc_only_splat, TRUE);

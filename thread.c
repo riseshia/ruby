@@ -5796,6 +5796,7 @@ recursive_push(VALUE list, VALUE obj, VALUE paired_obj)
 {
     VALUE pair_list;
 
+    GET_EC()->recursive_guard_depth++;
     if (!paired_obj) {
         rb_hash_aset(list, obj, Qtrue);
     }
@@ -5824,6 +5825,8 @@ recursive_push(VALUE list, VALUE obj, VALUE paired_obj)
 static int
 recursive_pop(VALUE list, VALUE obj, VALUE paired_obj)
 {
+    GET_EC()->recursive_guard_depth--;
+
     if (paired_obj) {
         VALUE pair_list = rb_hash_lookup2(list, obj, Qundef);
         if (UNDEF_P(pair_list)) {
@@ -5942,24 +5945,12 @@ rb_exec_recursive(VALUE (*func) (VALUE, VALUE, int), VALUE obj, VALUE arg)
  * current method is called recursively on the ordered pair <obj, paired_obj>
  */
 
-// Whether no rb_exec_recursive*() call made for +mid+ is in progress on this
-// thread, i.e. such a call made now could not detect recursion.
-bool
-rb_exec_recursive_idle_mid_p(ID mid)
-{
-    VALUE hash = threadptr_recursive_hash(GET_THREAD());
-    if (NIL_P(hash) || !RB_TYPE_P(hash, T_HASH)) return true;
-
-    VALUE list = rb_hash_lookup2(hash, mid ? ID2SYM(mid) : ID2SYM(idNULL), Qnil);
-    return !RB_TYPE_P(list, T_HASH) || RHASH_EMPTY_P(list);
-}
-
-// The same for the method that is running, which is what
-// rb_exec_recursive() and rb_exec_recursive_paired() key their guard on.
+// Whether no rb_exec_recursive*() call is in progress on this fiber, i.e. such a
+// call made now, for any method, could not detect recursion.
 bool
 rb_exec_recursive_idle_p(void)
 {
-    return rb_exec_recursive_idle_mid_p(rb_frame_last_func());
+    return GET_EC()->recursive_guard_depth == 0;
 }
 
 VALUE

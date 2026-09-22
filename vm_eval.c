@@ -61,6 +61,49 @@ rb_vm_call0(rb_execution_context_t *ec, VALUE recv, ID id, int argc, const VALUE
     return vm_call0_cc(ec, recv, id, argc, argv, &cc, kw_splat);
 }
 
+// Calls the ISEQ method +cme+ with the last kwarg->keyword_len elements of
+// +argv+ as literal keyword arguments, the way a `recv.mid(k: v)` call site
+// does: no Hash is built unless the method takes **rest.
+static VALUE
+vm_call0_iseq_with_kwarg(rb_execution_context_t *ec, VALUE recv, ID id, int argc, const VALUE *argv,
+                         const struct rb_callinfo_kwarg *kwarg, const rb_callable_method_entry_t *cme)
+{
+    const struct rb_callcache cc = VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, cme);
+    struct rb_calling_info calling = {
+        .cd = &(struct rb_call_data) {
+            .ci = &VM_CI_ON_STACK(id, VM_CALL_KWARG | VM_CALL_FCALL, argc, kwarg),
+            .cc = NULL,
+        },
+        .cc = &cc,
+        .block_handler = VM_BLOCK_HANDLER_NONE,
+        .recv = recv,
+        .argc = argc,
+        .kw_splat = 0,
+    };
+    return vm_call0_body(ec, &calling, argv);
+}
+
+// The method funcall of +mid+ on an instance of +klass+ runs, if it is written in Ruby
+const rb_callable_method_entry_t *
+rb_vm_iseq_method_entry(VALUE klass, ID mid)
+{
+    const rb_callable_method_entry_t *cme = rb_callable_method_entry(klass, mid);
+    return cme && cme->def->type == VM_METHOD_TYPE_ISEQ ? cme : NULL;
+}
+
+// Funcalls +mid+, written in Ruby, with +argv+ passed as the keywords named
+// +keywords+, without building a Hash. +cme+ comes from rb_vm_iseq_method_entry().
+VALUE
+rb_vm_call_iseq_with_keywords(VALUE recv, const rb_callable_method_entry_t *cme, int argc, const VALUE *argv, const VALUE *keywords)
+{
+    struct rb_callinfo_kwarg *kwarg = ALLOCA_N(struct rb_callinfo_kwarg, 1 + rb_callinfo_kwarg_bytes(argc) / sizeof(struct rb_callinfo_kwarg));
+    kwarg->keyword_len = argc;
+    kwarg->references = 0;
+    MEMCPY(kwarg->keywords, keywords, VALUE, argc);
+
+    return vm_call0_iseq_with_kwarg(GET_EC(), recv, cme->called_id, argc, argv, kwarg, cme);
+}
+
 VALUE
 rb_vm_call_with_refinements(rb_execution_context_t *ec, VALUE recv, ID id, int argc, const VALUE *argv, int kw_splat)
 {

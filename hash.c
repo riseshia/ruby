@@ -252,7 +252,7 @@ any_hash_without_call_p(VALUE a)
 static bool
 struct_hash_needs_no_guard_p(VALUE s)
 {
-    if (ruby_vm_c_events_enabled > 0 || !rb_exec_recursive_idle_mid_p(id_hash)) return false;
+    if (ruby_vm_c_events_enabled > 0 || !rb_exec_recursive_idle_p()) return false;
     if (!rb_method_basic_definition_p(CLASS_OF(rb_obj_class(s)), id_hash)) return false;
 
     long len = RSTRUCT_LEN_RAW(s);
@@ -5440,6 +5440,49 @@ rb_hash_bulk_insert(long argc, const VALUE *argv, VALUE hash)
             rb_hash_bulk_insert_into_st_table(argc, argv, hash);
         }
     }
+}
+
+// Fills an empty Hash with keys[i] => vals[i] for keys the caller knows to be distinct
+// Symbols, such as the member names of a Struct: there is no entry to look for, no #hash
+// or #eql? to call and no String key to copy, so the pairs go straight into the table.
+// Allocates no object, though a big table may allocate memory (keep what +keys+ and +vals+
+// point into alive and in place). Returns false, with nothing done, when the Hash cannot take the pairs
+// that way; rb_hash_bulk_insert() is for that case.
+static inline bool
+hash_fill_distinct_symbols(VALUE hash, long len, const VALUE *keys, const VALUE *vals, int step)
+{
+    if (RHASH_ST_TABLE_P(hash) && RHASH_ST_TABLE(hash)->num_entries == 0 && !RHASH_IDENTHASH_P(hash) && len >= 0) {
+        // A Hash made for more pairs than the small table holds. Adding a key that is known
+        // not to be there is what st_add_direct() is for.
+        st_table *tab = RHASH_ST_TABLE(hash);
+        for (long i = 0; i < len; i++) {
+            VALUE key = keys[i * step], val = vals[i * step];
+            HASH_ASSERT(SYMBOL_P(key));
+            st_add_direct(tab, (st_data_t)key, (st_data_t)val);
+            RB_OBJ_WRITTEN(hash, Qundef, key);
+            RB_OBJ_WRITTEN(hash, Qundef, val);
+        }
+        return true;
+    }
+    if (!RHASH_AR_TABLE_P(hash) || RHASH_AR_TABLE_BOUND(hash) != 0 || RHASH_IDENTHASH_P(hash)) return false;
+    if (len < 0 || (st_index_t)len > RHASH_AR_TABLE_MAX_BOUND(hash)) return false;
+
+    for (long i = 0; i < len; i++) {
+        VALUE key = keys[i * step], val = vals[i * step];
+        HASH_ASSERT(SYMBOL_P(key));
+        ar_set_entry(hash, (unsigned int)i, key, val, ar_do_hash(hash, key));
+        RB_OBJ_WRITTEN(hash, Qundef, key);
+        RB_OBJ_WRITTEN(hash, Qundef, val);
+    }
+    RHASH_AR_TABLE_BOUND_SET(hash, (st_index_t)len);
+    RHASH_AR_TABLE_SIZE_SET(hash, (st_index_t)len);
+    return true;
+}
+
+bool
+rb_hash_fill_distinct_symbols(VALUE hash, long len, const VALUE *keys, const VALUE *vals)
+{
+    return hash_fill_distinct_symbols(hash, len, keys, vals, 1);
 }
 
 static VALUE

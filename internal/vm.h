@@ -96,6 +96,8 @@ void rb_free_loaded_builtin_table(void);
 
 /* vm_insnhelper.c */
 VALUE rb_equal_opt(VALUE obj1, VALUE obj2);
+const struct rb_callable_method_entry_struct *rb_vm_iseq_method_entry(VALUE klass, ID mid);
+VALUE rb_vm_call_iseq_with_keywords(VALUE recv, const struct rb_callable_method_entry_struct *cme, int argc, const VALUE *argv, const VALUE *keywords);
 VALUE rb_eql_opt(VALUE obj1, VALUE obj2);
 
 struct rb_iseq_struct;

@@ -42,7 +42,6 @@ void rb_thread_reset_fork_lock(void);
 void rb_mutex_allow_trap(VALUE self, int val);
 VALUE rb_uninterruptible(VALUE (*b_proc)(VALUE), VALUE data);
 VALUE rb_mutex_owned_p(VALUE self);
-bool rb_exec_recursive_idle_mid_p(ID mid);
 bool rb_exec_recursive_idle_p(void);
 VALUE rb_exec_recursive_outer_mid(VALUE (*f)(VALUE g, VALUE h, int r), VALUE g, VALUE h, ID mid);
 void ruby_mn_threads_params(void);

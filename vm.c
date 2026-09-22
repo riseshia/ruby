@@ -3038,6 +3038,19 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
         catch_iseq = NULL;
 
         while (CFP_PC(ec->cfp) == 0 || CFP_ISEQ(ec->cfp) == 0) {
+            if (state == TAG_BREAK && ec->cfp == THROW_DATA_CATCH_FRAME(err) && rb_vm_data_new_trampoline_frame_p(ec->cfp)) {
+                // A `return` thrown to the method on top of a trampoline frame has been
+                // turned into a break to its caller, which for once is a C frame. Finish
+                // it as its trampoline would and hand the result to the frame that made
+                // the call, the way a break does.
+                VALUE val = rb_vm_data_new_trampoline_finish(ec);
+                rb_control_frame_t *caller_cfp = ec->cfp;
+                VM_ASSERT(CFP_ISEQ(caller_cfp));
+                *caller_cfp->sp++ = val;
+                ec->errinfo = Qnil;
+                rb_zjit_materialize_frames(ec, caller_cfp);
+                return Qundef;
+            }
             if (UNLIKELY(VM_FRAME_TYPE(ec->cfp) == VM_FRAME_MAGIC_CFUNC)) {
                 EXEC_EVENT_HOOK_AND_POP_FRAME(ec, RUBY_EVENT_C_RETURN, ec->cfp->self,
                                               rb_vm_frame_method_entry(ec->cfp)->def->original_id,
@@ -4227,6 +4240,7 @@ th_init(rb_thread_t *th, VALUE self, rb_vm_t *vm)
     th->ec->errinfo = Qnil;
     th->ec->root_svar = Qfalse;
     th->ec->local_storage_recursive_hash = Qnil;
+    th->ec->recursive_guard_depth = 0;
     th->ec->local_storage_recursive_hash_for_trace = Qnil;
 
     th->ec->storage = Qnil;

@@ -23,6 +23,8 @@
 #include "shape.h"
 #include "vm_core.h"
 #include "builtin.h"
+#include "probes.h"
+#include "yjit.h"
 
 /* only for struct[:field] access */
 enum {
@@ -38,6 +40,17 @@ static VALUE rb_cData;
 static ID id_members, id_back_members, id_keyword_init;
 
 static VALUE struct_alloc(VALUE);
+
+// Allocation tracing records the method an object was allocated in, so a path
+// that allocates without the frame of that method has to stand down for it.
+static inline bool
+newobj_hook_enabled_p(void)
+{
+    return ruby_vm_event_flags & RUBY_INTERNAL_EVENT_NEWOBJ;
+}
+
+static inline VALUE struct_alloc_n(VALUE klass, long n, bool fill_nil);
+static inline VALUE *data_alloc_frozen(VALUE klass, long n, VALUE *self_out);
 
 // Inline cache for the hidden ivars of Struct / Data classes. Classes made by
 // Struct.new or Data.define set these ivars in the same order and so share one
@@ -375,7 +388,7 @@ rb_struct_s_inspect(VALUE klass)
     return inspect;
 }
 
-#define KEYWORD_POSITIONS_MAX 16
+#define KEYWORD_POSITIONS_MAX 64
 
 struct keyword_positions {
     VALUE back_members;
@@ -438,7 +451,7 @@ data_initialize_positional(VALUE self, VALUE members, int argc, const VALUE *arg
     return self;
 }
 
-static VALUE
+VALUE
 rb_data_s_new(int argc, const VALUE *argv, VALUE klass)
 {
     if (rb_keyword_given_p()) {
@@ -482,6 +495,14 @@ rb_data_s_new(int argc, const VALUE *argv, VALUE klass)
             }
             return data_initialize_positional(self, members, argc, argv);
         }
+        const rb_callable_method_entry_t *initialize = argc > 0 && !rb_block_given_p() ? rb_vm_iseq_method_entry(klass, idInitialize) : NULL;
+        if (initialize) {
+            // An initialize written in Ruby can take the member names as literal
+            // keywords, the way `new(x: 1, y: 2)` reaches a plain class.
+            VALUE self = rb_obj_alloc(klass);
+            rb_vm_call_iseq_with_keywords(self, initialize, argc, argv, RARRAY_CONST_PTR(members));
+            return self;
+        }
         VALUE arg_hash = rb_hash_new_capa(argc);
         for (long i=0; i<argc; i++) {
             VALUE k = rb_ary_entry(members, i), v = argv[i];
@@ -489,6 +510,100 @@ rb_data_s_new(int argc, const VALUE *argv, VALUE klass)
         }
         return rb_class_new_instance_kw(1, &arg_hash, klass, RB_PASS_KEYWORDS);
     }
+}
+
+// The names a positional Data.new turns its +argc+ arguments into, or NULL when the
+// regular call has to deal with them (too many, or an inconsistent class).
+const VALUE *
+rb_data_positional_keywords(VALUE klass, int argc)
+{
+    VALUE members = struct_ivar_get(klass, id_members);
+    if (!RB_TYPE_P(members, T_ARRAY) || argc > RARRAY_LEN(members)) return NULL;
+    return RARRAY_CONST_PTR(members);
+}
+
+// Data.new for the interpreter, which calls this instead of pushing a frame for
+// rb_data_s_new() when the call site passes positional arguments or literal
+// keywords only. +keywords+ are the keyword names of the call site, their values
+// the last +keyword_len+ elements of +argv+. Does what rb_data_s_new() does when
+// every member is given and initialize is the built-in one; returns Qundef, with
+// nothing done, in any other case. Keywords are resolved before allocating so
+// that giving up leaves no instance behind.
+VALUE
+rb_data_new_without_frame(VALUE klass, int argc, const VALUE *argv, int keyword_len, const VALUE *keywords)
+{
+    // The caller has looked initialize up and found the built-in one
+    if (keyword_len != 0 && keyword_len != argc) return Qundef;
+    if (argc > KEYWORD_POSITIONS_MAX || newobj_hook_enabled_p() || ruby_vm_c_events_enabled > 0) return Qundef;
+    if (rb_get_alloc_func(klass) != struct_alloc) return Qundef;
+
+    VALUE members = struct_ivar_get(klass, id_members);
+    if (!RB_TYPE_P(members, T_ARRAY) || RARRAY_LEN(members) != argc) return Qundef;
+
+    int positions[KEYWORD_POSITIONS_MAX];
+    if (keyword_len != 0) {
+        VALUE back = struct_ivar_get(klass, id_back_members);
+        if (!struct_back_members_usable_p(back, argc)) return Qundef;
+
+        uint64_t given = 0;
+        for (int i = 0; i < argc; i++) {
+            positions[i] = struct_back_members_pos(back, argc, keywords[i]);
+            if (positions[i] < 0 || (given & (UINT64_C(1) << positions[i]))) return Qundef;
+            given |= UINT64_C(1) << positions[i];
+        }
+    }
+
+    VALUE self, *ptr = data_alloc_frozen(klass, argc, &self);
+    for (int i = 0; i < argc; i++) {
+        ptr[keyword_len ? positions[i] : i] = argv[i];
+    }
+    return self;
+}
+
+// Data.new(**hash) for the interpreter. A C function owns its keyword Hash, so the VM
+// copies +hash+ before the call; the built-in initialize only reads it. Does what
+// rb_data_s_new() does when the keys name every member, from +hash+ itself; returns
+// Qundef, with nothing done, in any other case.
+VALUE
+rb_data_new_kw_splat_without_frame(VALUE klass, VALUE hash)
+{
+    if (newobj_hook_enabled_p() || !data_initialize_unobservable_p(klass)) return Qundef;
+    if (rb_get_alloc_func(klass) != struct_alloc) return Qundef;
+
+    VALUE members = struct_ivar_get(klass, id_members);
+    if (!RB_TYPE_P(members, T_ARRAY)) return Qundef;
+
+    long n = RARRAY_LEN(members);
+    struct keyword_positions kw;
+    if (n > KEYWORD_POSITIONS_MAX || !resolve_keyword_positions(klass, n, hash, &kw) || kw.count != n) return Qundef;
+
+    VALUE self, *ptr = data_alloc_frozen(klass, n, &self);
+    for (int i = 0; i < kw.count; i++) {
+        ptr[kw.positions[i]] = kw.values[i];
+    }
+    return self;
+}
+
+// Struct#initialize(**hash) for the interpreter, for the same reason. Fills the members
+// when the class takes keywords as members and every key names one; returns false, with
+// nothing done, in any other case.
+bool
+rb_struct_initialize_kw_splat_without_frame(VALUE self, VALUE hash)
+{
+    if (!RB_TYPE_P(self, T_STRUCT) || OBJ_FROZEN(self)) return false;
+
+    VALUE klass = rb_obj_class(self);
+    long n = RSTRUCT_LEN_RAW(self);
+    if (rb_struct_s_keyword_init(klass) == Qfalse) return false;
+
+    struct keyword_positions kw;
+    if (RHASH_SIZE(hash) > KEYWORD_POSITIONS_MAX || !resolve_keyword_positions(klass, n, hash, &kw)) return false;
+
+    rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
+    for (int i = 0; i < kw.count; i++) {
+        RSTRUCT_SET_RAW(self, kw.positions[i], kw.values[i]);
+    }
+    return true;
 }
 
 #if 0 /* for RDoc */
@@ -890,7 +1005,7 @@ struct struct_hash_set_arg {
 
 static int rb_struct_pos(VALUE s, VALUE *name, bool name_only);
 static int struct_pos_cached(VALUE s, VALUE *name, bool name_only, VALUE *back);
-static VALUE deconstruct_keys(VALUE s, VALUE keys, bool name_only);
+static VALUE deconstruct_keys(VALUE s, VALUE keys, bool name_only, bool block_given);
 
 static int
 struct_hash_aset(VALUE key, VALUE val, struct struct_hash_set_arg *args, bool name_only)
@@ -917,7 +1032,108 @@ struct_hash_set_i(VALUE key, VALUE val, VALUE arg)
     return ST_CONTINUE;
 }
 
-static VALUE
+// rb_struct_initialize_without_frame() for a call site without keywords on a class
+// the caller knows not to be keyword_init: true.
+bool
+rb_struct_initialize_positional_without_frame(VALUE self, int argc, const VALUE *argv)
+{
+    if (!RB_TYPE_P(self, T_STRUCT) || OBJ_FROZEN(self)) return false;
+
+    long n = RSTRUCT_LEN_RAW(self);
+    if (argc > n) return false;
+
+    for (long i = 0; i < argc; i++) {
+        RSTRUCT_SET_RAW(self, i, argv[i]);
+    }
+    for (long i = argc; i < n; i++) {
+        RSTRUCT_SET_RAW(self, i, Qnil);
+    }
+    return true;
+}
+
+// Whether initialize of +klass+ is the C function of Struct
+static bool
+struct_initialize_builtin_p(VALUE klass)
+{
+    const rb_callable_method_entry_t *cme = rb_callable_method_entry(klass, idInitialize);
+    return cme && cme->def->type == VM_METHOD_TYPE_CFUNC && cme->def->body.cfunc.func == (rb_cfunc_t)rb_struct_initialize_m;
+}
+
+// Whether +klass+ is a class whose instances struct_alloc() makes
+bool
+rb_struct_alloc_class_p(VALUE klass)
+{
+    return RB_TYPE_P(klass, T_CLASS) && rb_get_alloc_func(klass) == struct_alloc;
+}
+
+// `Point[1, 2]` and any other call of new that is not compiled to opt_new: Class#new
+// called on a Struct class with positional arguments. Does what allocating and the
+// built-in initialize would do when that cannot raise, without the frames of new and
+// initialize; returns Qundef, with nothing done, in any other case. The instance
+// is new, so the members are stored without a write barrier.
+VALUE
+rb_struct_new_without_frame(VALUE klass, int argc, const VALUE *argv)
+{
+    if (ruby_vm_c_events_enabled > 0 || newobj_hook_enabled_p()) return Qundef;
+    if (!rb_struct_alloc_class_p(klass)) return Qundef;
+    if (!struct_initialize_builtin_p(klass) || RTEST(rb_struct_s_keyword_init(klass))) return Qundef;
+
+    VALUE members = struct_ivar_get(klass, id_members);
+    if (!RB_TYPE_P(members, T_ARRAY)) return Qundef;
+    long n = RARRAY_LEN(members);
+    if (argc > n) return Qundef;
+
+    VALUE self = struct_alloc_n(klass, n, false);
+    VALUE *ptr = (VALUE *)RSTRUCT_CONST_PTR(self);
+    for (long i = 0; i < argc; i++) ptr[i] = argv[i];
+    for (long i = argc; i < n; i++) ptr[i] = Qnil;
+    return self;
+}
+
+// Struct#initialize for the interpreter, which calls this instead of pushing a
+// frame for rb_struct_initialize_m() when the call site passes positional
+// arguments or literal keywords only (see rb_data_new_without_frame() for the
+// arguments). Fills the members when that cannot raise; returns false, with
+// nothing done, in any other case.
+bool
+rb_struct_initialize_without_frame(VALUE self, int argc, const VALUE *argv, int keyword_len, const VALUE *keywords)
+{
+    if (!RB_TYPE_P(self, T_STRUCT) || OBJ_FROZEN(self)) return false;
+
+    VALUE klass = rb_obj_class(self);
+    long n = RSTRUCT_LEN_RAW(self);
+    VALUE keyword_init = rb_struct_s_keyword_init(klass);
+
+    if (keyword_len == 0) {
+        if (RTEST(keyword_init) || argc > n) return false;
+
+        for (long i = 0; i < argc; i++) {
+            RSTRUCT_SET_RAW(self, i, argv[i]);
+        }
+        rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self) + argc, n - argc);
+        return true;
+    }
+
+    // Only keywords, for a class that takes them as members (keyword_init: true or unset)
+    if (keyword_len != argc || argc > KEYWORD_POSITIONS_MAX || keyword_init == Qfalse) return false;
+
+    VALUE back = struct_ivar_get(klass, id_back_members);
+    if (!struct_back_members_usable_p(back, n)) return false;
+
+    int positions[KEYWORD_POSITIONS_MAX];
+    for (int i = 0; i < argc; i++) {
+        positions[i] = struct_back_members_pos(back, n, keywords[i]);
+        if (positions[i] < 0) return false;
+    }
+
+    rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
+    for (int i = 0; i < argc; i++) {
+        RSTRUCT_SET_RAW(self, positions[i], argv[i]);
+    }
+    return true;
+}
+
+VALUE
 rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
 {
     VALUE klass = rb_obj_class(self);
@@ -996,25 +1212,28 @@ struct_heap_alloc(VALUE st, size_t len)
 
 STATIC_ASSERT(robject_rstruct_fields_offset, offsetof(struct RObject, as.extended) == offsetof(struct RStruct, fields_obj));
 
-static VALUE
-struct_alloc(VALUE klass)
+// Allocates an instance of +klass+, which has +n+ members. A caller that stores
+// every member before anything else can allocate passes false for +fill_nil+.
+static inline VALUE
+struct_alloc_with(VALUE klass, long n, bool fill_nil, VALUE flags, shape_id_t shape_id)
 {
-    long n = num_members(klass);
     size_t embedded_size = offsetof(struct RStruct, as.ary) + (sizeof(VALUE) * n);
-    VALUE flags = T_STRUCT;
     const long embed_len_max = RSTRUCT_EMBED_LEN_MASK >> RSTRUCT_EMBED_LEN_SHIFT;
 
     if (n > 0 && n <= embed_len_max && rb_gc_size_allocatable_p(embedded_size)) {
         flags |= n << RSTRUCT_EMBED_LEN_SHIFT;
 
-        VALUE st = rb_newobj(GET_EC(), klass, flags, ROOT_SHAPE_ID | SHAPE_ID_LAYOUT_EXTENDED, true, embedded_size);
+        VALUE st = rb_newobj(GET_EC(), klass, flags, shape_id, true, embedded_size);
         RSTRUCT_SET_FIELDS_OBJ(st, 0);
-        rb_mem_clear((VALUE *)RSTRUCT(st)->as.ary, n);
+        if (fill_nil) {
+            VALUE *ptr = (VALUE *)RSTRUCT(st)->as.ary;
+            for (long i = 0; i < n; i++) ptr[i] = Qnil;
+        }
 
         return st;
     }
     else {
-        VALUE obj = rb_newobj(GET_EC(), klass, flags, ROOT_SHAPE_ID | SHAPE_ID_LAYOUT_EXTENDED, true, sizeof(struct RStruct));
+        VALUE obj = rb_newobj(GET_EC(), klass, flags, shape_id, true, sizeof(struct RStruct));
         struct RStruct *st = RSTRUCT(obj);
 
         st->fields_obj = 0;
@@ -1027,6 +1246,31 @@ struct_alloc(VALUE klass)
 
         return obj;
     }
+}
+
+static inline VALUE
+struct_alloc_n(VALUE klass, long n, bool fill_nil)
+{
+    return struct_alloc_with(klass, n, fill_nil, T_STRUCT, ROOT_SHAPE_ID | SHAPE_ID_LAYOUT_EXTENDED);
+}
+
+// An instance of the Data class +klass+ (+n+ members) that is frozen from the start,
+// for callers that have established that the built-in initialize would only fill and
+// freeze it. Returns where the members go: the caller stores all of them before
+// anything else can allocate. The instance is new, so it is not old and needs no
+// write barrier for those stores, like the elements of a new Array.
+static inline VALUE *
+data_alloc_frozen(VALUE klass, long n, VALUE *self_out)
+{
+    *self_out = struct_alloc_with(klass, n, false, T_STRUCT | FL_FREEZE,
+                                  ROOT_SHAPE_ID | SHAPE_ID_LAYOUT_EXTENDED | SHAPE_ID_FL_FROZEN);
+    return (VALUE *)RSTRUCT_CONST_PTR(*self_out);
+}
+
+static VALUE
+struct_alloc(VALUE klass)
+{
+    return struct_alloc_n(klass, num_members(klass), true);
 }
 
 // Whether `klass` allocates its instances with struct_alloc.
@@ -1161,21 +1405,209 @@ inspect_struct_prefix(VALUE s, const char *prefix)
     return str;
 }
 
-static VALUE
-inspect_struct(VALUE s, VALUE prefix, int recur)
+// Members whose inspect cannot run Ruby code or come back to the struct when it is
+// the built-in C function: Integer, Float, String, Symbol, nil, true and false.
+// That function is looked up at most once per kind and Struct#inspect; with no one
+// listening for the call either, it is called directly (or, for a Fixnum, nil, true
+// and false, not at all: the text is written straight into the buffer).
+enum inspect_direct_kind {
+    INSPECT_DIRECT_FIXNUM, INSPECT_DIRECT_BIGNUM, INSPECT_DIRECT_FLOAT, INSPECT_DIRECT_STRING,
+    INSPECT_DIRECT_SYMBOL, INSPECT_DIRECT_NIL, INSPECT_DIRECT_TRUE, INSPECT_DIRECT_FALSE,
+    INSPECT_DIRECT_KINDS
+};
+
+struct inspect_direct {
+    const rb_method_cfunc_t *cfunc[INSPECT_DIRECT_KINDS]; // NULL: not looked up yet
+    bool nested; // members that are structs have been checked to be writable in place
+};
+
+static const rb_method_cfunc_t inspect_direct_none;
+
+static const rb_method_cfunc_t *
+inspect_direct_cfunc(struct inspect_direct *direct, VALUE value)
+{
+    static ID id_inspect;
+    enum inspect_direct_kind kind;
+
+    if (FIXNUM_P(value)) kind = INSPECT_DIRECT_FIXNUM;
+    else if (NIL_P(value)) kind = INSPECT_DIRECT_NIL;
+    else if (value == Qtrue) kind = INSPECT_DIRECT_TRUE;
+    else if (value == Qfalse) kind = INSPECT_DIRECT_FALSE;
+    else if (SYMBOL_P(value)) kind = INSPECT_DIRECT_SYMBOL;
+    else if (RB_FLOAT_TYPE_P(value)) kind = INSPECT_DIRECT_FLOAT;
+    else if (SPECIAL_CONST_P(value)) return NULL;
+    else if (RBASIC_CLASS(value) == rb_cString) kind = INSPECT_DIRECT_STRING;
+    else if (RB_BIGNUM_TYPE_P(value) && RBASIC_CLASS(value) == rb_cInteger) kind = INSPECT_DIRECT_BIGNUM;
+    else return NULL;
+
+    if (!direct->cfunc[kind]) {
+        if (!id_inspect) id_inspect = rb_intern("inspect");
+        const rb_callable_method_entry_t *cme = ruby_vm_c_events_enabled == 0 ?
+            rb_callable_method_entry(CLASS_OF(value), id_inspect) : NULL;
+        bool builtin = cme && METHOD_ENTRY_BASIC(cme) && cme->def->type == VM_METHOD_TYPE_CFUNC &&
+            (cme->def->body.cfunc.argc == 0 || cme->def->body.cfunc.argc == -1);
+        direct->cfunc[kind] = builtin ? &cme->def->body.cfunc : &inspect_direct_none;
+    }
+    return direct->cfunc[kind] == &inspect_direct_none ? NULL : direct->cfunc[kind];
+}
+
+// Raw bytes on their way into the result. Appending each piece (", ", a name, "=", a
+// number) on its own costs more than the bytes do, so they are collected here and appended
+// together. Whatever looks at the String itself flushes first: rb_str_append() settles the
+// encoding by what the String holds.
+struct inspect_bytes {
+    VALUE str;
+    long len;
+    char bytes[160];
+};
+
+static void
+inspect_bytes_flush(struct inspect_bytes *out)
+{
+    if (out->len > 0) {
+        rb_str_buf_cat(out->str, out->bytes, out->len);
+        out->len = 0;
+    }
+}
+
+static void
+inspect_bytes_cat(struct inspect_bytes *out, const char *ptr, long len)
+{
+    if (len > (long)sizeof(out->bytes) - out->len) {
+        inspect_bytes_flush(out);
+        if (len > (long)sizeof(out->bytes)) {
+            rb_str_buf_cat(out->str, ptr, len);
+            return;
+        }
+    }
+    memcpy(out->bytes + out->len, ptr, len);
+    out->len += len;
+}
+
+static void
+inspect_bytes_append(struct inspect_bytes *out, VALUE text)
+{
+    inspect_bytes_flush(out);
+    rb_str_append(out->str, text);
+}
+
+// Appends what rb_str_append(str, rb_inspect(value)) would. The text of a Fixnum,
+// nil, true and false is ASCII, so for an ASCII compatible String appending the
+// bytes is all rb_str_append() would do.
+static void
+inspect_struct_append_value(struct inspect_direct *direct, struct inspect_bytes *out, VALUE value)
+{
+    const rb_method_cfunc_t *cfunc = inspect_direct_cfunc(direct, value);
+    VALUE str = out->str;
+
+    if (!cfunc) {
+        // rb_inspect() may run anything; the bytes so far belong in the String before that
+        inspect_bytes_flush(out);
+        rb_str_append(str, rb_inspect(value));
+    }
+    else if (FIXNUM_P(value) && rb_enc_asciicompat(rb_enc_get(str))) {
+        char buf[sizeof(long) * CHAR_BIT / 3 + 3], *end = buf + sizeof(buf), *p = end;
+        long n = FIX2LONG(value);
+        unsigned long u = n < 0 ? 0UL - (unsigned long)n : (unsigned long)n;
+        do { *--p = (char)('0' + u % 10); } while (u /= 10);
+        if (n < 0) *--p = '-';
+        inspect_bytes_cat(out, p, end - p);
+    }
+    else if ((NIL_P(value) || value == Qtrue || value == Qfalse) && rb_enc_asciicompat(rb_enc_get(str))) {
+        const char *text = NIL_P(value) ? "nil" : value == Qtrue ? "true" : "false";
+        inspect_bytes_cat(out, text, (long)strlen(text));
+    }
+    else {
+        VALUE text = cfunc->argc == 0 ?
+            ((VALUE (*)(VALUE))cfunc->func)(value) :
+            ((VALUE (*)(int, const VALUE *, VALUE))cfunc->func)(0, NULL, value);
+        // Only the text of a Symbol can be in an encoding rb_inspect() would not let
+        // through: rb_str_inspect() already answers in the right one, numbers are ASCII.
+        inspect_bytes_append(out, SYMBOL_P(value) ? rb_inspect_result(text) : text);
+    }
+}
+
+static VALUE rb_struct_inspect(VALUE s);
+static VALUE rb_data_inspect(VALUE s);
+
+#define INSPECT_NESTED_DEPTH_MAX 3
+
+// "#<struct" or "#<data" when inspect of +s+ is the built-in one, NULL otherwise
+static const char *
+inspect_struct_builtin_prefix(VALUE s)
+{
+    static ID id_inspect;
+    if (!id_inspect) id_inspect = rb_intern("inspect");
+
+    const rb_callable_method_entry_t *cme = rb_callable_method_entry(CLASS_OF(s), id_inspect);
+    if (!cme || cme->def->type != VM_METHOD_TYPE_CFUNC) return NULL;
+    if (cme->def->body.cfunc.func == (rb_cfunc_t)rb_struct_inspect) return "#<struct";
+    if (cme->def->body.cfunc.func == (rb_cfunc_t)rb_data_inspect) return "#<data";
+    return NULL;
+}
+
+// Whether the text of a member that is a Struct / Data can be written as part of the text
+// of the struct holding it: built-in inspect, nobody listening for the call, and nothing
+// in its class or member names that rb_inspect() would have to look at (they are ASCII).
+static bool
+inspect_struct_nested_p(VALUE s)
+{
+    if (ruby_vm_c_events_enabled > 0 || !inspect_struct_builtin_prefix(s)) return false;
+
+    VALUE klass = rb_obj_class(s);
+    if (!rb_enc_str_asciionly_p(rb_class_path(klass))) return false;
+
+    VALUE members = struct_ivar_get(klass, id_members);
+    if (!RB_TYPE_P(members, T_ARRAY) || RARRAY_LEN(members) != RSTRUCT_LEN_RAW(s)) return false;
+    for (long i = 0; i < RARRAY_LEN(members); i++) {
+        VALUE slot = RARRAY_AREF(members, i);
+        ID id = SYM2ID(slot);
+        if (!(rb_is_local_id(id) || rb_is_const_id(id)) || !rb_enc_str_asciionly_p(rb_sym2str(slot))) return false;
+    }
+    return true;
+}
+
+// Whether inspecting the members of +s+ cannot come back to +s+, so that the
+// recursion guard has nothing to guard: leaves, and structs of such members. A
+// cycle would not end, so the depth limit turns it down.
+static bool
+inspect_struct_leaf_members_at_p(struct inspect_direct *direct, VALUE s, int depth)
+{
+    long len = RSTRUCT_LEN_RAW(s);
+    for (long i = 0; i < len; i++) {
+        VALUE value = RSTRUCT_GET_RAW(s, i);
+        if (inspect_direct_cfunc(direct, value)) continue;
+        if (depth < INSPECT_NESTED_DEPTH_MAX && !SPECIAL_CONST_P(value) && RB_TYPE_P(value, T_STRUCT) &&
+            inspect_struct_nested_p(value) && inspect_struct_leaf_members_at_p(direct, value, depth + 1)) continue;
+        return false;
+    }
+    return true;
+}
+
+static bool
+inspect_struct_leaf_members_p(struct inspect_direct *direct, VALUE s)
+{
+    return inspect_struct_leaf_members_at_p(direct, s, 0);
+}
+
+// Writes what comes after the "#<struct" of +s+. +direct+ carries what
+// inspect_struct_leaf_members_p() has already looked up.
+static void
+inspect_struct_write(struct inspect_bytes *out_ptr, VALUE s, int recur, struct inspect_direct *direct)
 {
     VALUE cname = rb_class_path(rb_obj_class(s));
     VALUE members;
-    VALUE str = prefix;
+    VALUE str = out_ptr->str;
     long i, len;
     char first = RSTRING_PTR(cname)[0];
 
     if (recur || first != '#') {
-        rb_str_cat2(str, " ");
-        rb_str_append(str, cname);
+        inspect_bytes_cat(out_ptr, " ", 1);
+        inspect_bytes_append(out_ptr, cname);
     }
     if (recur) {
-        return rb_str_cat2(str, ":...>");
+        inspect_bytes_cat(out_ptr, ":...>", 5);
+        return;
     }
 
     members = rb_struct_members(s);
@@ -1186,25 +1618,56 @@ inspect_struct(VALUE s, VALUE prefix, int recur)
         ID id;
 
         if (i > 0) {
-            rb_str_cat2(str, ", ");
+            inspect_bytes_cat(out_ptr, ", ", 2);
         }
         else {
-            rb_str_cat2(str, " ");
+            inspect_bytes_cat(out_ptr, " ", 1);
         }
         slot = RARRAY_AREF(members, i);
         id = SYM2ID(slot);
         if (rb_is_local_id(id) || rb_is_const_id(id)) {
-            rb_str_append(str, rb_sym2str(slot));
+            VALUE name = rb_sym2str(slot);
+            if (rb_enc_str_asciionly_p(name) && rb_enc_asciicompat(rb_enc_get(str))) {
+                // what rb_str_append() comes down to for ASCII text
+                inspect_bytes_cat(out_ptr, RSTRING_PTR(name), RSTRING_LEN(name));
+            }
+            else {
+                inspect_bytes_append(out_ptr, name);
+            }
         }
         else {
+            inspect_bytes_flush(out_ptr);
             rb_str_append(str, rb_inspect(slot));
         }
-        rb_str_cat2(str, "=");
-        rb_str_append(str, rb_inspect(RSTRUCT_GET_RAW(s, i)));
+        inspect_bytes_cat(out_ptr, "=", 1);
+        VALUE value = RSTRUCT_GET_RAW(s, i);
+        const char *nested = !SPECIAL_CONST_P(value) && RB_TYPE_P(value, T_STRUCT) && !inspect_direct_cfunc(direct, value) && direct->nested ?
+            inspect_struct_builtin_prefix(value) : NULL;
+        if (nested) {
+            inspect_bytes_cat(out_ptr, nested, (long)strlen(nested));
+            inspect_struct_write(out_ptr, value, 0, direct);
+        }
+        else {
+            inspect_struct_append_value(direct, out_ptr, value);
+        }
     }
-    rb_str_cat2(str, ">");
+    inspect_bytes_cat(out_ptr, ">", 1);
+}
 
-    return str;
+static VALUE
+inspect_struct_members(VALUE s, VALUE prefix, int recur, struct inspect_direct *direct)
+{
+    struct inspect_bytes out = { .str = prefix };
+    inspect_struct_write(&out, s, recur, direct);
+    inspect_bytes_flush(&out);
+    return prefix;
+}
+
+static VALUE
+inspect_struct(VALUE s, VALUE prefix, int recur)
+{
+    struct inspect_direct direct = {0};
+    return inspect_struct_members(s, prefix, recur, &direct);
 }
 
 /*
@@ -1222,6 +1685,11 @@ inspect_struct(VALUE s, VALUE prefix, int recur)
 static VALUE
 rb_struct_inspect(VALUE s)
 {
+    struct inspect_direct direct = {0};
+    if (inspect_struct_leaf_members_p(&direct, s)) {
+        direct.nested = true;
+        return inspect_struct_members(s, inspect_struct_prefix(s, "#<struct"), 0, &direct);
+    }
     return rb_exec_recursive(inspect_struct, s, inspect_struct_prefix(s, "#<struct"));
 }
 
@@ -1268,16 +1736,21 @@ rb_struct_to_a(VALUE s)
  */
 
 static VALUE
-rb_struct_to_h(VALUE s)
+struct_to_h_of(VALUE s, VALUE members, bool block_given)
 {
     VALUE h = rb_hash_new_capa(RSTRUCT_LEN_RAW(s));
-    VALUE members = rb_struct_members(s);
     long i;
 
-    if (!rb_block_given_p()) {
+    if (!block_given) {
         // Member names are distinct Symbols, so the pairs can go in without
         // the per-key work of rb_hash_aset().
         long len = RSTRUCT_LEN_RAW(s);
+        if (rb_hash_fill_distinct_symbols(h, len, RARRAY_CONST_PTR(members), RSTRUCT_CONST_PTR(s))) {
+            // Filling a big table may allocate memory; the pointers above must stay put
+            RB_GC_GUARD(members);
+            RB_GC_GUARD(s);
+            return h;
+        }
         VALUE buffer;
         VALUE *pairs = ALLOCV_N(VALUE, buffer, len * 2);
         for (i = 0; i < len; i++) {
@@ -1294,6 +1767,18 @@ rb_struct_to_h(VALUE s)
         rb_hash_set_pair(h, rb_yield_values(2, k, v));
     }
     return h;
+}
+
+static VALUE
+struct_to_h(VALUE s, bool block_given)
+{
+    return struct_to_h_of(s, rb_struct_members(s), block_given);
+}
+
+static VALUE
+rb_struct_to_h(VALUE s)
+{
+    return struct_to_h(s, rb_block_given_p());
 }
 
 /*
@@ -1316,17 +1801,45 @@ rb_struct_to_h(VALUE s)
 static VALUE
 rb_struct_deconstruct_keys(VALUE s, VALUE keys)
 {
-    return deconstruct_keys(s, keys, false);
+    return deconstruct_keys(s, keys, false, rb_block_given_p());
+}
+
+#define DECONSTRUCT_SYMBOL_KEYS_MAX 8
+
+// What a pattern like `in {x:, y:}` asks for: a few Symbols, none given twice. Finding the
+// members runs no Ruby code, and such pairs can go into the empty +h+ without the per-key
+// work of rb_hash_aset(), like the ones of to_h. Returns false, with +h+ still empty, for
+// any other list of keys.
+static bool
+deconstruct_symbol_keys(VALUE s, VALUE keys, VALUE h)
+{
+    long len = RARRAY_LEN(keys), n;
+    if (len > DECONSTRUCT_SYMBOL_KEYS_MAX) return false;
+
+    VALUE names[DECONSTRUCT_SYMBOL_KEYS_MAX], values[DECONSTRUCT_SYMBOL_KEYS_MAX];
+    VALUE back = 0;
+    for (n = 0; n < len; n++) {
+        VALUE key = RARRAY_AREF(keys, n);
+        if (!SYMBOL_P(key)) return false;
+        for (long seen = 0; seen < n; seen++) {
+            if (names[seen] == key) return false;
+        }
+        int pos = struct_pos_cached(s, &key, false, &back);
+        if (pos < 0) break; // the Hash ends before the first name that is not a member
+        names[n] = key;
+        values[n] = RSTRUCT_GET_RAW(s, pos);
+    }
+    return rb_hash_fill_distinct_symbols(h, n, names, values);
 }
 
 static VALUE
-deconstruct_keys(VALUE s, VALUE keys, bool name_only)
+deconstruct_keys(VALUE s, VALUE keys, bool name_only, bool block_given)
 {
     VALUE h;
     long i;
 
     if (NIL_P(keys)) {
-        return rb_struct_to_h(s);
+        return struct_to_h(s, block_given);
     }
     if (UNLIKELY(!RB_TYPE_P(keys, T_ARRAY))) {
         rb_raise(rb_eTypeError,
@@ -1338,6 +1851,9 @@ deconstruct_keys(VALUE s, VALUE keys, bool name_only)
         return rb_hash_new();
     }
     h = rb_hash_new_capa(RARRAY_LEN(keys));
+    if (deconstruct_symbol_keys(s, keys, h)) {
+        return h;
+    }
     VALUE back = 0;
     for (i=0; i<RARRAY_LEN(keys); i++) {
         VALUE key = RARRAY_AREF(keys, i);
@@ -1607,19 +2123,35 @@ rb_struct_select(int argc, VALUE *argv, VALUE s)
 // Qundef when a call would be needed. Without a call nothing can re-enter the
 // comparison, so the recursion guard has nothing to catch. It answers Qtrue
 // both for equal structs and for a pair that is already being compared, so
-// Qtrue stands as is; Qfalse only stands when no comparison is in progress
-// further up the stack, where the same pair would compare as Qtrue.
+// Qtrue stands as is; Qfalse only stands when no comparison of the same pair
+// is in progress further up the stack, where it would compare as Qtrue.
+//
+// Such a comparison went through the members in the same order and got past
+// the pair that differs here, so that pair has changed since. That cannot
+// happen when both structs and both values are frozen (a Data with Integer,
+// Symbol, Float or frozen String members), which saves looking the guard up.
+static inline bool
+struct_equal_immutable_p(VALUE v)
+{
+    return SPECIAL_CONST_P(v) || OBJ_FROZEN_RAW(v);
+}
+
 static VALUE
 struct_equal_without_call(VALUE s, VALUE s2, VALUE (*opt_equal)(VALUE, VALUE))
 {
     long len = RSTRUCT_LEN_RAW(s);
+    const VALUE *ptr = RSTRUCT_CONST_PTR(s), *ptr2 = RSTRUCT_CONST_PTR(s2);
+    bool frozen = OBJ_FROZEN_RAW(s) && OBJ_FROZEN_RAW(s2);
     for (long i = 0; i < len; i++) {
-        VALUE v = RSTRUCT_GET_RAW(s, i), v2 = RSTRUCT_GET_RAW(s2, i);
+        VALUE v = ptr[i], v2 = ptr2[i];
         if (v == v2) continue;
 
         VALUE result = opt_equal(v, v2);
         if (UNDEF_P(result)) return Qundef;
-        if (!RTEST(result)) return rb_exec_recursive_idle_p() ? Qfalse : Qundef;
+        if (!RTEST(result)) {
+            if (frozen && struct_equal_immutable_p(v) && struct_equal_immutable_p(v2)) return Qfalse;
+            return rb_exec_recursive_idle_p() ? Qfalse : Qundef;
+        }
     }
     return Qtrue;
 }
@@ -1658,12 +2190,13 @@ recursive_equal(VALUE s, VALUE s2, int recur)
  *    joe_jr == joe # => false
  */
 
-static VALUE
+VALUE
 rb_struct_equal(VALUE s, VALUE s2)
 {
     if (s == s2) return Qtrue;
     if (!RB_TYPE_P(s2, T_STRUCT)) return Qfalse;
-    if (rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
+    // Instances without a singleton class mostly: the same klass is the same class
+    if (RBASIC_CLASS(s) != RBASIC_CLASS(s2) && rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
     if (RSTRUCT_LEN_RAW(s) != RSTRUCT_LEN_RAW(s2)) {
         rb_bug("inconsistent struct"); /* should never happen */
     }
@@ -1742,12 +2275,13 @@ recursive_eql(VALUE s, VALUE s2, int recur)
  *  Related: Object#==.
  */
 
-static VALUE
+VALUE
 rb_struct_eql(VALUE s, VALUE s2)
 {
     if (s == s2) return Qtrue;
     if (!RB_TYPE_P(s2, T_STRUCT)) return Qfalse;
-    if (rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
+    // Instances without a singleton class mostly: the same klass is the same class
+    if (RBASIC_CLASS(s) != RBASIC_CLASS(s2) && rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
     if (RSTRUCT_LEN_RAW(s) != RSTRUCT_LEN_RAW(s2)) {
         rb_bug("inconsistent struct"); /* should never happen */
     }
@@ -2054,7 +2588,57 @@ data_hash_set_i(VALUE key, VALUE val, VALUE arg)
  *
  */
 
-static VALUE
+
+// Data#initialize for the interpreter, which calls this instead of pushing a
+// frame for rb_data_initialize_m() when the call site passes literal keywords
+// only: the `super(x:, y:)` of an overridden initialize. Fills and freezes self
+// when every member is named exactly once, which cannot raise; returns false,
+// with nothing done, in any other case.
+bool
+rb_data_initialize_without_frame(VALUE self, int argc, const VALUE *argv, const VALUE *keywords)
+{
+    if (!RB_TYPE_P(self, T_STRUCT) || OBJ_FROZEN(self)) return false;
+
+    long n = RSTRUCT_LEN_RAW(self);
+    if (argc != n || n > KEYWORD_POSITIONS_MAX) return false;
+
+    VALUE back = struct_ivar_get(rb_obj_class(self), id_back_members);
+    if (!struct_back_members_usable_p(back, n)) return false;
+
+    int positions[KEYWORD_POSITIONS_MAX];
+    uint64_t given = 0;
+    for (int i = 0; i < argc; i++) {
+        positions[i] = struct_back_members_pos(back, n, keywords[i]);
+        if (positions[i] < 0 || (given & (UINT64_C(1) << positions[i]))) return false;
+        given |= UINT64_C(1) << positions[i];
+    }
+
+    for (int i = 0; i < argc; i++) {
+        RSTRUCT_SET_RAW(self, positions[i], argv[i]);
+    }
+    OBJ_FREEZE(self);
+    return true;
+}
+
+// Data#initialize(**hash) for the interpreter: what `super` amounts to in
+// `def initialize(**kw) = super`. See rb_data_new_kw_splat_without_frame() about the Hash.
+bool
+rb_data_initialize_kw_splat_without_frame(VALUE self, VALUE hash)
+{
+    if (!RB_TYPE_P(self, T_STRUCT) || OBJ_FROZEN(self)) return false;
+
+    long n = RSTRUCT_LEN_RAW(self);
+    struct keyword_positions kw;
+    if (n > KEYWORD_POSITIONS_MAX || !resolve_keyword_positions(rb_obj_class(self), n, hash, &kw) || kw.count != n) return false;
+
+    for (int i = 0; i < kw.count; i++) {
+        RSTRUCT_SET_RAW(self, kw.positions[i], kw.values[i]);
+    }
+    OBJ_FREEZE(self);
+    return true;
+}
+
+VALUE
 rb_data_initialize_m(int argc, const VALUE *argv, VALUE self)
 {
     VALUE klass = rb_obj_class(self);
@@ -2185,7 +2769,98 @@ data_with_direct(VALUE self, VALUE kwargs)
     return copy;
 }
 
+// A frozen copy of +self+ with argv[i] stored at positions[i]. The caller has
+// established everything data_with_without_frame() checks.
 static VALUE
+data_with_positions(VALUE self, VALUE klass, long argc, const VALUE *argv, const int *positions)
+{
+    long n = RSTRUCT_LEN_RAW(self);
+    VALUE copy, *ptr = data_alloc_frozen(klass, n, &copy);
+
+    MEMCPY(ptr, RSTRUCT_CONST_PTR(self), VALUE, n);
+    for (long i = 0; i < argc; i++) {
+        ptr[positions[i]] = argv[i];
+    }
+    return copy;
+}
+
+// Data#with for the interpreter, which calls this instead of pushing a frame for
+// rb_data_with() when the call site passes literal keywords only: +keywords+ are
+// their names, +argv+ their values. Returns Qundef, with nothing done, unless
+// the copy can be made without initialize and without raising.
+VALUE
+rb_data_with_without_frame(VALUE self, int argc, const VALUE *argv, const VALUE *keywords)
+{
+    if (!RB_TYPE_P(self, T_STRUCT) || argc == 0 || argc > KEYWORD_POSITIONS_MAX || newobj_hook_enabled_p()) return Qundef;
+
+    VALUE klass = rb_obj_class(self);
+    if (rb_get_alloc_func(klass) != struct_alloc || !data_initialize_unobservable_p(klass)) return Qundef;
+
+    long n = RSTRUCT_LEN_RAW(self);
+    VALUE back = struct_ivar_get(klass, id_back_members);
+    if (!struct_back_members_usable_p(back, n)) return Qundef;
+
+    int positions[KEYWORD_POSITIONS_MAX];
+    for (int i = 0; i < argc; i++) {
+        positions[i] = struct_back_members_pos(back, n, keywords[i]);
+        if (positions[i] < 0) return Qundef;
+    }
+    return data_with_positions(self, klass, argc, argv, positions);
+}
+
+// Data#with(**hash) for the interpreter, which would otherwise copy +hash+ for
+// rb_data_with() to own; see rb_data_new_kw_splat_without_frame().
+VALUE
+rb_data_with_kw_splat_without_frame(VALUE self, VALUE hash)
+{
+    if (!RB_TYPE_P(self, T_STRUCT) || newobj_hook_enabled_p()) return Qundef;
+
+    VALUE klass = rb_obj_class(self);
+    if (rb_get_alloc_func(klass) != struct_alloc || !data_initialize_unobservable_p(klass)) return Qundef;
+
+    struct keyword_positions kw;
+    if (!resolve_keyword_positions(klass, RSTRUCT_LEN_RAW(self), hash, &kw)) return Qundef;
+    return data_with_positions(self, klass, kw.count, kw.values, kw.positions);
+}
+
+// The arguments of `Point.new(*row)`: NULL when the regular call has to deal
+// with +ary+, whose last element may be a Hash flagged to be passed as keywords.
+static const VALUE *
+jit_splat_arguments(VALUE ary, long *len_out)
+{
+    if (!RB_TYPE_P(ary, T_ARRAY)) return NULL;
+
+    long len = RARRAY_LEN(ary);
+    if (len > 0) {
+        VALUE last = RARRAY_AREF(ary, len - 1);
+        if (RB_TYPE_P(last, T_HASH) && (RBASIC(last)->flags & RHASH_PASS_AS_KEYWORDS)) return NULL;
+    }
+    *len_out = len;
+    return RARRAY_CONST_PTR(ary);
+}
+
+// Struct#initialize(*ary) for the interpreter, which calls it without a frame. Qnil when the
+// members are filled; Qundef, with nothing done, when the regular call has to be made.
+VALUE
+rb_struct_initialize_splat_without_frame(VALUE self, VALUE ary)
+{
+    long len;
+    const VALUE *argv = jit_splat_arguments(ary, &len);
+    if (!argv || len > INT_MAX) return Qundef;
+    return rb_struct_initialize_without_frame(self, (int)len, argv, 0, NULL) ? Qnil : Qundef;
+}
+
+// Data.new(*ary) for the interpreter; see rb_data_new_without_frame()
+VALUE
+rb_data_new_splat_without_frame(VALUE klass, VALUE ary)
+{
+    long len;
+    const VALUE *argv = jit_splat_arguments(ary, &len);
+    if (!argv || len > INT_MAX || !RB_TYPE_P(klass, T_CLASS) || !data_initialize_unobservable_p(klass)) return Qundef;
+    return rb_data_new_without_frame(klass, (int)len, argv, 0, NULL);
+}
+
+VALUE
 rb_data_with(int argc, const VALUE *argv, VALUE self)
 {
     VALUE kwargs;
@@ -2194,7 +2869,8 @@ rb_data_with(int argc, const VALUE *argv, VALUE self)
         return self;
     }
 
-    VALUE copy = data_with_direct(self, kwargs);
+    // The regular path hands a block on to to_h, which then wants pairs from it
+    VALUE copy = rb_block_given_p() ? Qundef : data_with_direct(self, kwargs);
     if (!UNDEF_P(copy)) return copy;
 
     VALUE h = rb_struct_to_h(self);
@@ -2224,6 +2900,11 @@ rb_data_with(int argc, const VALUE *argv, VALUE self)
 static VALUE
 rb_data_inspect(VALUE s)
 {
+    struct inspect_direct direct = {0};
+    if (inspect_struct_leaf_members_p(&direct, s)) {
+        direct.nested = true;
+        return inspect_struct_members(s, inspect_struct_prefix(s, "#<data"), 0, &direct);
+    }
     return rb_exec_recursive(inspect_struct, s, inspect_struct_prefix(s, "#<data"));
 }
 
@@ -2403,7 +3084,7 @@ rb_data_inspect(VALUE s)
 static VALUE
 rb_data_deconstruct_keys(VALUE s, VALUE keys)
 {
-    return deconstruct_keys(s, keys, true);
+    return deconstruct_keys(s, keys, true, rb_block_given_p());
 }
 
 /*

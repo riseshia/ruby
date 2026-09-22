@@ -162,6 +162,8 @@ default:                        \
     if (UNDEF_P(val)) { \
         VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH); \
         val = vm_exec(ec); \
+        /* the call may have pushed a C frame under the method it ran; see rb_vm_data_new_trampoline() */ \
+        if (UNLIKELY(rb_vm_data_new_trampoline_frame_p(ec->cfp))) val = rb_vm_data_new_trampoline_finish(ec); \
     } \
 } while (0)
 
@@ -182,6 +184,12 @@ default:                        \
             if (func) { \
                 val = zjit_entry(ec, ec->cfp, func); \
             } \
+        } \
+        /* The JIT code returned, but into a frame the call pushed under the method: hand it */ \
+        /* the value and let the interpreter run it; see rb_vm_data_new_trampoline() */ \
+        if (!UNDEF_P(val) && UNLIKELY(GET_CFP() != ec->cfp)) { \
+            *ec->cfp->sp++ = val; \
+            val = Qundef; \
         } \
     } \
 } while (0)
