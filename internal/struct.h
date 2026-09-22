@@ -47,6 +47,7 @@ struct RStruct {
 VALUE rb_struct_init_copy(VALUE copy, VALUE s);
 VALUE rb_struct_lookup(VALUE s, VALUE idx);
 VALUE rb_struct_hash(VALUE s);
+VALUE rb_struct_hash_of_basic_class(VALUE s);
 VALUE rb_struct_eql_without_call(VALUE s, VALUE s2);
 VALUE rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self);
 VALUE rb_struct_new_without_frame(VALUE klass, int argc, const VALUE *argv);

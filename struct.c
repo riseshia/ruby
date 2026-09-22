@@ -2226,14 +2226,15 @@ rb_struct_equal(VALUE s, VALUE s2)
  *  Related: Object#hash.
  */
 
-VALUE
-rb_struct_hash(VALUE s)
+// The hash of +s+, starting from +class_hash+: what rb_hash() makes of its class
+static VALUE
+struct_hash(VALUE s, VALUE class_hash)
 {
     long i, len;
     st_index_t h;
     VALUE n;
 
-    h = rb_hash_start(rb_hash(rb_obj_class(s)));
+    h = rb_hash_start(class_hash);
     len = RSTRUCT_LEN_RAW(s);
     for (i = 0; i < len; i++) {
         n = rb_hash(RSTRUCT_GET_RAW(s, i));
@@ -2241,6 +2242,22 @@ rb_struct_hash(VALUE s)
     }
     h = rb_hash_end(h);
     return ST2FIX(h);
+}
+
+VALUE
+rb_struct_hash(VALUE s)
+{
+    return struct_hash(s, rb_hash(rb_obj_class(s)));
+}
+
+VALUE rb_obj_hash(VALUE obj);
+
+// Struct#hash for hash.c, which found the hash of the class to be Kernel#hash:
+// what rb_hash() would call, without looking the method up again
+VALUE
+rb_struct_hash_of_basic_class(VALUE s)
+{
+    return struct_hash(s, rb_obj_hash(rb_obj_class(s)));
 }
 
 static VALUE

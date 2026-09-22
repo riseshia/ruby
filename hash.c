@@ -282,7 +282,7 @@ obj_any_hash(VALUE obj)
                 hval = rb_obj_hash(obj);
             }
             else if (cme->def->type == VM_METHOD_TYPE_CFUNC && cme->def->body.cfunc.func == (rb_cfunc_t)rb_struct_hash) {
-                if (RB_TYPE_P(obj, T_STRUCT) && struct_hash_needs_no_guard_p(obj)) hval = rb_struct_hash(obj);
+                if (RB_TYPE_P(obj, T_STRUCT) && struct_hash_needs_no_guard_p(obj)) hval = rb_struct_hash_of_basic_class(obj);
             }
             else if (RBASIC_CLASS(cme->defined_class) == rb_mKernel) {
                 hval = rb_vm_call0(GET_EC(), obj, id_hash, 0, 0, cme, 0);
