@@ -1,0 +1,10 @@
+Results quoted in the grant proposal. master (wt-base) is ruby/ruby b20a1ab61b; the branch
+(wt-vm) is experiment/struct-data-vm-only rebased on it. x86_64 Linux, one process per cell.
+
+matrix.*  misc/initialize_matrix_bench.rb (ns per construction)
+ops.*     misc/struct_survey_cells_bench.rb, min of 3 (ns per operation)
+ruby-bench.txt  ruby/ruby-bench struct-new-no-escape and data-new-no-escape.rb (the same
+          with Data.define), min of the last 20 iterations in ms,
+          WARMUP_ITRS=40 MIN_BENCH_ITRS=20 MIN_BENCH_TIME=0
+bench_all.sh  the driver (the ruby-bench step was rerun by hand with RUBYLIB set)
+ZJIT runs use --zjit-call-threshold=2 --zjit-num-profiles=1.
