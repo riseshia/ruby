@@ -190,9 +190,8 @@ struct_set_members(VALUE klass, VALUE /* frozen hidden array */ members)
 }
 
 static inline int
-struct_member_pos(VALUE s, VALUE name)
+struct_back_members_pos(VALUE back, long len, VALUE name)
 {
-    VALUE back = struct_ivar_get(rb_obj_class(s), id_back_members);
     rb_len_t j, mask;
 
     if (UNLIKELY(NIL_P(back))) {
@@ -205,10 +204,10 @@ struct_member_pos(VALUE s, VALUE name)
     mask = RARRAY_LEN(back);
 
     if (mask <= AREF_HASH_THRESHOLD) {
-        if (UNLIKELY(RSTRUCT_LEN_RAW(s) != mask)) {
+        if (UNLIKELY(len != mask)) {
             rb_raise(rb_eTypeError,
                      "struct size differs (%"PRIdLEN" required %"PRIdLEN" given)",
-                     mask, RSTRUCT_LEN_RAW(s));
+                     mask, len);
         }
         for (j = 0; j < mask; j++) {
             if (RARRAY_AREF(back, j) == name)
@@ -217,9 +216,9 @@ struct_member_pos(VALUE s, VALUE name)
         return -1;
     }
 
-    if (UNLIKELY(RSTRUCT_LEN_RAW(s) != FIX2INT(RARRAY_AREF(back, mask-1)))) {
+    if (UNLIKELY(len != FIX2INT(RARRAY_AREF(back, mask-1)))) {
         rb_raise(rb_eTypeError, "struct size differs (%d required %"PRIdLEN" given)",
-                 FIX2INT(RARRAY_AREF(back, mask-1)), RSTRUCT_LEN_RAW(s));
+                 FIX2INT(RARRAY_AREF(back, mask-1)), len);
     }
 
     mask -= 3;
@@ -234,6 +233,29 @@ struct_member_pos(VALUE s, VALUE name)
         }
         j = struct_member_pos_probe(j, mask);
     }
+}
+
+// Whether struct_back_members_pos(back, len, ...) can run without raising.
+static bool
+struct_back_members_usable_p(VALUE back, long len)
+{
+    if (!RB_TYPE_P(back, T_ARRAY)) return false;
+
+    long mask = RARRAY_LEN(back);
+    if (mask <= AREF_HASH_THRESHOLD) return len == mask;
+    return len == FIX2INT(RARRAY_AREF(back, mask-1));
+}
+
+static inline int
+struct_member_pos_in(VALUE s, VALUE name, VALUE back)
+{
+    return struct_back_members_pos(back, RSTRUCT_LEN_RAW(s), name);
+}
+
+static inline int
+struct_member_pos(VALUE s, VALUE name)
+{
+    return struct_member_pos_in(s, name, struct_ivar_get(rb_obj_class(s), id_back_members));
 }
 
 /*
@@ -349,6 +371,52 @@ rb_struct_s_inspect(VALUE klass)
         rb_str_cat_cstr(inspect, "(keyword_init: true)");
     }
     return inspect;
+}
+
+#define KEYWORD_POSITIONS_MAX 64
+
+struct keyword_positions {
+    VALUE back_members;
+    long len;
+    int count;
+    int positions[KEYWORD_POSITIONS_MAX];
+    VALUE values[KEYWORD_POSITIONS_MAX];
+};
+
+static int
+keyword_positions_i(st_data_t key, st_data_t val, st_data_t ptr)
+{
+    struct keyword_positions *kw = (struct keyword_positions *)ptr;
+    VALUE name = (VALUE)key;
+    int pos = SYMBOL_P(name) ? struct_back_members_pos(kw->back_members, kw->len, name) : -1;
+
+    if (pos < 0 || kw->count == KEYWORD_POSITIONS_MAX) {
+        kw->count = -1;
+        return ST_STOP;
+    }
+    kw->positions[kw->count] = pos;
+    kw->values[kw->count] = (VALUE)val;
+    kw->count++;
+    return ST_CONTINUE;
+}
+
+// Resolves every key of +hash+ to a member position of +klass+ (which has +len+
+// members), provided all of them are Symbols naming a member. That runs no Ruby code and changes nothing, so the
+// Hash can be walked without the rb_ensure() rb_hash_foreach() sets up. On
+// false the caller goes on as if this had not been tried.
+static bool
+resolve_keyword_positions(VALUE klass, long len, VALUE hash, struct keyword_positions *kw)
+{
+    // Only the header: the arrays are filled up to count, and a compound literal
+    // would clear all of them (some 800 bytes) on every call.
+    kw->back_members = struct_ivar_get(klass, id_back_members);
+    kw->len = len;
+    kw->count = 0;
+    // An inconsistent class is left to the regular path, which raises for it.
+    if (!struct_back_members_usable_p(kw->back_members, len)) return false;
+
+    rb_hash_stlike_foreach(hash, keyword_positions_i, (st_data_t)kw);
+    return kw->count >= 0;
 }
 
 static VALUE
@@ -773,17 +841,18 @@ struct struct_hash_set_arg {
     VALUE self;
     VALUE unknown_keywords;
     VALUE missing_keywords;
+    VALUE back_members;
     rb_len_t missing_count;
 };
 
 static int rb_struct_pos(VALUE s, VALUE *name, bool name_only);
+static int struct_pos_cached(VALUE s, VALUE *name, bool name_only, VALUE *back);
 static VALUE deconstruct_keys(VALUE s, VALUE keys, bool name_only);
-static int rb_struct_pos(VALUE s, VALUE *name, bool name_only);
 
 static int
 struct_hash_aset(VALUE key, VALUE val, struct struct_hash_set_arg *args, bool name_only)
 {
-    int i = rb_struct_pos(args->self, &key, name_only);
+    int i = struct_pos_cached(args->self, &key, name_only, &args->back_members);
     if (i < 0) {
         if (NIL_P(args->unknown_keywords)) {
             args->unknown_keywords = rb_ary_new();
@@ -834,7 +903,14 @@ rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
         keyword_init = rb_keyword_given_p();
         break;
     }
-    if (keyword_init) {
+    struct keyword_positions kw;
+    if (keyword_init && resolve_keyword_positions(klass, n, argv[0], &kw)) {
+        rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
+        for (int i = 0; i < kw.count; i++) {
+            RSTRUCT_SET_RAW(self, kw.positions[i], kw.values[i]);
+        }
+    }
+    else if (keyword_init) {
         struct struct_hash_set_arg arg = {
             .self = self,
             .unknown_keywords = Qnil,
@@ -1251,19 +1327,21 @@ rb_struct_init_copy(VALUE copy, VALUE s)
     return copy;
 }
 
+// +back+ caches __back_members__ across calls for the same struct; start it at 0.
+// It is filled on first use so that errors are raised at the same point as before.
 static int
-rb_struct_pos(VALUE s, VALUE *name, bool name_only)
+struct_pos_cached(VALUE s, VALUE *name, bool name_only, VALUE *back)
 {
     rb_len_t i;
     VALUE idx = *name;
 
-    if (SYMBOL_P(idx)) {
-        return struct_member_pos(s, idx);
-    }
-    else if (name_only || RB_TYPE_P(idx, T_STRING)) {
+    if (!SYMBOL_P(idx) && (name_only || RB_TYPE_P(idx, T_STRING))) {
         idx = rb_check_symbol(name);
         if (NIL_P(idx)) return -1;
-        return struct_member_pos(s, idx);
+    }
+    if (SYMBOL_P(idx)) {
+        if (!*back) *back = struct_ivar_get(rb_obj_class(s), id_back_members);
+        return struct_member_pos_in(s, idx, *back);
     }
     else {
         rb_len_t len;
@@ -1282,6 +1360,13 @@ rb_struct_pos(VALUE s, VALUE *name, bool name_only)
         }
         return (int)i;
     }
+}
+
+static int
+rb_struct_pos(VALUE s, VALUE *name, bool name_only)
+{
+    VALUE back = 0;
+    return struct_pos_cached(s, name, name_only, &back);
 }
 
 static void
