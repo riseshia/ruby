@@ -1,0 +1,15 @@
+with_lit class 139.7
+with_lit struct -
+with_lit data 86.1
+eq_other class 61.1
+eq_other struct 25.1
+eq_other data 26.5
+hkey class 256.2
+hkey struct 187.9
+hkey data 85.2
+to_h class 72.2
+to_h struct 41.1
+to_h data 42.1
+inspect class 180.6
+inspect struct 165.9
+inspect data 166.9
