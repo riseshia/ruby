@@ -728,11 +728,10 @@ rb_any_to_s(VALUE obj)
     return str;
 }
 
+// What rb_inspect() makes of the String an inspect method returned
 VALUE
-rb_inspect(VALUE obj)
+rb_inspect_result(VALUE str)
 {
-    VALUE str = rb_obj_as_string(rb_funcallv(obj, id_inspect, 0, 0));
-
     rb_encoding *enc = rb_default_internal_encoding();
     if (enc == NULL) enc = rb_default_external_encoding();
     if (!rb_enc_asciicompat(enc)) {
@@ -743,6 +742,12 @@ rb_inspect(VALUE obj)
     if (rb_enc_get(str) != enc && !rb_enc_str_asciionly_p(str))
         return rb_str_escape(str);
     return str;
+}
+
+VALUE
+rb_inspect(VALUE obj)
+{
+    return rb_inspect_result(rb_obj_as_string(rb_funcallv(obj, id_inspect, 0, 0)));
 }
 
 static int

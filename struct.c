@@ -1183,21 +1183,219 @@ rb_struct_each_pair(VALUE s)
     return s;
 }
 
+// The result grows by a name, a value and punctuation per member; start with
+// room for that instead of growing out of an embedded String step by step.
 static VALUE
-inspect_struct(VALUE s, VALUE prefix, int recur)
+inspect_struct_prefix(VALUE s, const char *prefix)
+{
+    VALUE str = rb_str_buf_new(32 + 16 * RSTRUCT_LEN_RAW(s));
+    rb_str_cat_cstr(str, prefix);
+    return str;
+}
+
+// Members whose inspect cannot run Ruby code or come back to the struct when it is
+// the built-in C function: Integer, Float, String, Symbol, nil, true and false.
+// That function is looked up at most once per kind and Struct#inspect; with no one
+// listening for the call either, it is called directly (or, for a Fixnum, nil, true
+// and false, not at all: the text is written straight into the buffer).
+enum inspect_direct_kind {
+    INSPECT_DIRECT_FIXNUM, INSPECT_DIRECT_BIGNUM, INSPECT_DIRECT_FLOAT, INSPECT_DIRECT_STRING,
+    INSPECT_DIRECT_SYMBOL, INSPECT_DIRECT_NIL, INSPECT_DIRECT_TRUE, INSPECT_DIRECT_FALSE,
+    INSPECT_DIRECT_KINDS
+};
+
+struct inspect_direct {
+    const rb_method_cfunc_t *cfunc[INSPECT_DIRECT_KINDS]; // NULL: not looked up yet
+    bool nested; // members that are structs have been checked to be writable in place
+};
+
+static const rb_method_cfunc_t inspect_direct_none;
+
+static const rb_method_cfunc_t *
+inspect_direct_cfunc(struct inspect_direct *direct, VALUE value)
+{
+    static ID id_inspect;
+    enum inspect_direct_kind kind;
+
+    if (FIXNUM_P(value)) kind = INSPECT_DIRECT_FIXNUM;
+    else if (NIL_P(value)) kind = INSPECT_DIRECT_NIL;
+    else if (value == Qtrue) kind = INSPECT_DIRECT_TRUE;
+    else if (value == Qfalse) kind = INSPECT_DIRECT_FALSE;
+    else if (SYMBOL_P(value)) kind = INSPECT_DIRECT_SYMBOL;
+    else if (RB_FLOAT_TYPE_P(value)) kind = INSPECT_DIRECT_FLOAT;
+    else if (SPECIAL_CONST_P(value)) return NULL;
+    else if (RBASIC_CLASS(value) == rb_cString) kind = INSPECT_DIRECT_STRING;
+    else if (RB_BIGNUM_TYPE_P(value) && RBASIC_CLASS(value) == rb_cInteger) kind = INSPECT_DIRECT_BIGNUM;
+    else return NULL;
+
+    if (!direct->cfunc[kind]) {
+        if (!id_inspect) id_inspect = rb_intern("inspect");
+        const rb_callable_method_entry_t *cme = ruby_vm_c_events_enabled == 0 ?
+            rb_callable_method_entry(CLASS_OF(value), id_inspect) : NULL;
+        bool builtin = cme && METHOD_ENTRY_BASIC(cme) && cme->def->type == VM_METHOD_TYPE_CFUNC &&
+            (cme->def->body.cfunc.argc == 0 || cme->def->body.cfunc.argc == -1);
+        direct->cfunc[kind] = builtin ? &cme->def->body.cfunc : &inspect_direct_none;
+    }
+    return direct->cfunc[kind] == &inspect_direct_none ? NULL : direct->cfunc[kind];
+}
+
+// Raw bytes on their way into the result. Appending each piece (", ", a name, "=", a
+// number) on its own costs more than the bytes do, so they are collected here and appended
+// together. Whatever looks at the String itself flushes first: rb_str_append() settles the
+// encoding by what the String holds.
+struct inspect_bytes {
+    VALUE str;
+    long len;
+    char bytes[160];
+};
+
+static void
+inspect_bytes_flush(struct inspect_bytes *out)
+{
+    if (out->len > 0) {
+        rb_str_buf_cat(out->str, out->bytes, out->len);
+        out->len = 0;
+    }
+}
+
+static void
+inspect_bytes_cat(struct inspect_bytes *out, const char *ptr, long len)
+{
+    if (len > (long)sizeof(out->bytes) - out->len) {
+        inspect_bytes_flush(out);
+        if (len > (long)sizeof(out->bytes)) {
+            rb_str_buf_cat(out->str, ptr, len);
+            return;
+        }
+    }
+    memcpy(out->bytes + out->len, ptr, len);
+    out->len += len;
+}
+
+static void
+inspect_bytes_append(struct inspect_bytes *out, VALUE text)
+{
+    inspect_bytes_flush(out);
+    rb_str_append(out->str, text);
+}
+
+// Appends what rb_str_append(str, rb_inspect(value)) would. The text of a Fixnum,
+// nil, true and false is ASCII, so for an ASCII compatible String appending the
+// bytes is all rb_str_append() would do.
+static void
+inspect_struct_append_value(struct inspect_direct *direct, struct inspect_bytes *out, VALUE value)
+{
+    const rb_method_cfunc_t *cfunc = inspect_direct_cfunc(direct, value);
+    VALUE str = out->str;
+
+    if (!cfunc) {
+        // rb_inspect() may run anything; the bytes so far belong in the String before that
+        inspect_bytes_flush(out);
+        rb_str_append(str, rb_inspect(value));
+    }
+    else if (FIXNUM_P(value) && rb_enc_asciicompat(rb_enc_get(str))) {
+        char buf[sizeof(long) * CHAR_BIT / 3 + 3], *end = buf + sizeof(buf), *p = end;
+        long n = FIX2LONG(value);
+        unsigned long u = n < 0 ? 0UL - (unsigned long)n : (unsigned long)n;
+        do { *--p = (char)('0' + u % 10); } while (u /= 10);
+        if (n < 0) *--p = '-';
+        inspect_bytes_cat(out, p, end - p);
+    }
+    else if ((NIL_P(value) || value == Qtrue || value == Qfalse) && rb_enc_asciicompat(rb_enc_get(str))) {
+        const char *text = NIL_P(value) ? "nil" : value == Qtrue ? "true" : "false";
+        inspect_bytes_cat(out, text, (long)strlen(text));
+    }
+    else {
+        VALUE text = cfunc->argc == 0 ?
+            ((VALUE (*)(VALUE))cfunc->func)(value) :
+            ((VALUE (*)(int, const VALUE *, VALUE))cfunc->func)(0, NULL, value);
+        // Only the text of a Symbol can be in an encoding rb_inspect() would not let
+        // through: rb_str_inspect() already answers in the right one, numbers are ASCII.
+        inspect_bytes_append(out, SYMBOL_P(value) ? rb_inspect_result(text) : text);
+    }
+}
+
+static VALUE rb_struct_inspect(VALUE s);
+static VALUE rb_data_inspect(VALUE s);
+
+#define INSPECT_NESTED_DEPTH_MAX 3
+
+// "#<struct" or "#<data" when inspect of +s+ is the built-in one, NULL otherwise
+static const char *
+inspect_struct_builtin_prefix(VALUE s)
+{
+    static ID id_inspect;
+    if (!id_inspect) id_inspect = rb_intern("inspect");
+
+    const rb_callable_method_entry_t *cme = rb_callable_method_entry(CLASS_OF(s), id_inspect);
+    if (!cme || cme->def->type != VM_METHOD_TYPE_CFUNC) return NULL;
+    if (cme->def->body.cfunc.func == (rb_cfunc_t)rb_struct_inspect) return "#<struct";
+    if (cme->def->body.cfunc.func == (rb_cfunc_t)rb_data_inspect) return "#<data";
+    return NULL;
+}
+
+// Whether the text of a member that is a Struct / Data can be written as part of the text
+// of the struct holding it: built-in inspect, nobody listening for the call, and nothing
+// in its class or member names that rb_inspect() would have to look at (they are ASCII).
+static bool
+inspect_struct_nested_p(VALUE s)
+{
+    if (ruby_vm_c_events_enabled > 0 || !inspect_struct_builtin_prefix(s)) return false;
+
+    VALUE klass = rb_obj_class(s);
+    if (!rb_enc_str_asciionly_p(rb_class_path(klass))) return false;
+
+    VALUE members = struct_ivar_get(klass, id_members);
+    if (!RB_TYPE_P(members, T_ARRAY) || RARRAY_LEN(members) != RSTRUCT_LEN_RAW(s)) return false;
+    for (long i = 0; i < RARRAY_LEN(members); i++) {
+        VALUE slot = RARRAY_AREF(members, i);
+        ID id = SYM2ID(slot);
+        if (!(rb_is_local_id(id) || rb_is_const_id(id)) || !rb_enc_str_asciionly_p(rb_sym2str(slot))) return false;
+    }
+    return true;
+}
+
+// Whether inspecting the members of +s+ cannot come back to +s+, so that the
+// recursion guard has nothing to guard: leaves, and structs of such members. A
+// cycle would not end, so the depth limit turns it down.
+static bool
+inspect_struct_leaf_members_at_p(struct inspect_direct *direct, VALUE s, int depth)
+{
+    long len = RSTRUCT_LEN_RAW(s);
+    for (long i = 0; i < len; i++) {
+        VALUE value = RSTRUCT_GET_RAW(s, i);
+        if (inspect_direct_cfunc(direct, value)) continue;
+        if (depth < INSPECT_NESTED_DEPTH_MAX && !SPECIAL_CONST_P(value) && RB_TYPE_P(value, T_STRUCT) &&
+            inspect_struct_nested_p(value) && inspect_struct_leaf_members_at_p(direct, value, depth + 1)) continue;
+        return false;
+    }
+    return true;
+}
+
+static bool
+inspect_struct_leaf_members_p(struct inspect_direct *direct, VALUE s)
+{
+    return inspect_struct_leaf_members_at_p(direct, s, 0);
+}
+
+// Writes what comes after the "#<struct" of +s+. +direct+ carries what
+// inspect_struct_leaf_members_p() has already looked up.
+static void
+inspect_struct_write(struct inspect_bytes *out_ptr, VALUE s, int recur, struct inspect_direct *direct)
 {
     VALUE cname = rb_class_path(rb_obj_class(s));
     VALUE members;
-    VALUE str = prefix;
+    VALUE str = out_ptr->str;
     rb_len_t i, len;
     char first = RSTRING_PTR(cname)[0];
 
     if (recur || first != '#') {
-        rb_str_cat2(str, " ");
-        rb_str_append(str, cname);
+        inspect_bytes_cat(out_ptr, " ", 1);
+        inspect_bytes_append(out_ptr, cname);
     }
     if (recur) {
-        return rb_str_cat2(str, ":...>");
+        inspect_bytes_cat(out_ptr, ":...>", 5);
+        return;
     }
 
     members = rb_struct_members(s);
@@ -1208,25 +1406,56 @@ inspect_struct(VALUE s, VALUE prefix, int recur)
         ID id;
 
         if (i > 0) {
-            rb_str_cat2(str, ", ");
+            inspect_bytes_cat(out_ptr, ", ", 2);
         }
         else {
-            rb_str_cat2(str, " ");
+            inspect_bytes_cat(out_ptr, " ", 1);
         }
         slot = RARRAY_AREF(members, i);
         id = SYM2ID(slot);
         if (rb_is_local_id(id) || rb_is_const_id(id)) {
-            rb_str_append(str, rb_sym2str(slot));
+            VALUE name = rb_sym2str(slot);
+            if (rb_enc_str_asciionly_p(name) && rb_enc_asciicompat(rb_enc_get(str))) {
+                // what rb_str_append() comes down to for ASCII text
+                inspect_bytes_cat(out_ptr, RSTRING_PTR(name), RSTRING_LEN(name));
+            }
+            else {
+                inspect_bytes_append(out_ptr, name);
+            }
         }
         else {
+            inspect_bytes_flush(out_ptr);
             rb_str_append(str, rb_inspect(slot));
         }
-        rb_str_cat2(str, "=");
-        rb_str_append(str, rb_inspect(RSTRUCT_GET_RAW(s, i)));
+        inspect_bytes_cat(out_ptr, "=", 1);
+        VALUE value = RSTRUCT_GET_RAW(s, i);
+        const char *nested = !SPECIAL_CONST_P(value) && RB_TYPE_P(value, T_STRUCT) && !inspect_direct_cfunc(direct, value) && direct->nested ?
+            inspect_struct_builtin_prefix(value) : NULL;
+        if (nested) {
+            inspect_bytes_cat(out_ptr, nested, (long)strlen(nested));
+            inspect_struct_write(out_ptr, value, 0, direct);
+        }
+        else {
+            inspect_struct_append_value(direct, out_ptr, value);
+        }
     }
-    rb_str_cat2(str, ">");
+    inspect_bytes_cat(out_ptr, ">", 1);
+}
 
-    return str;
+static VALUE
+inspect_struct_members(VALUE s, VALUE prefix, int recur, struct inspect_direct *direct)
+{
+    struct inspect_bytes out = { .str = prefix };
+    inspect_struct_write(&out, s, recur, direct);
+    inspect_bytes_flush(&out);
+    return prefix;
+}
+
+static VALUE
+inspect_struct(VALUE s, VALUE prefix, int recur)
+{
+    struct inspect_direct direct = {0};
+    return inspect_struct_members(s, prefix, recur, &direct);
 }
 
 /*
@@ -1244,7 +1473,12 @@ inspect_struct(VALUE s, VALUE prefix, int recur)
 static VALUE
 rb_struct_inspect(VALUE s)
 {
-    return rb_exec_recursive(inspect_struct, s, rb_str_new2("#<struct"));
+    struct inspect_direct direct = {0};
+    if (inspect_struct_leaf_members_p(&direct, s)) {
+        direct.nested = true;
+        return inspect_struct_members(s, inspect_struct_prefix(s, "#<struct"), 0, &direct);
+    }
+    return rb_exec_recursive(inspect_struct, s, inspect_struct_prefix(s, "#<struct"));
 }
 
 /*
@@ -2364,7 +2598,12 @@ rb_data_with(int argc, const VALUE *argv, VALUE self)
 static VALUE
 rb_data_inspect(VALUE s)
 {
-    return rb_exec_recursive(inspect_struct, s, rb_str_new2("#<data"));
+    struct inspect_direct direct = {0};
+    if (inspect_struct_leaf_members_p(&direct, s)) {
+        direct.nested = true;
+        return inspect_struct_members(s, inspect_struct_prefix(s, "#<data"), 0, &direct);
+    }
+    return rb_exec_recursive(inspect_struct, s, inspect_struct_prefix(s, "#<data"));
 }
 
 /*
