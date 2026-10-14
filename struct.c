@@ -898,7 +898,7 @@ struct struct_hash_set_arg {
 
 static int rb_struct_pos(VALUE s, VALUE *name, bool name_only);
 static int struct_pos_cached(VALUE s, VALUE *name, bool name_only, VALUE *back);
-static VALUE deconstruct_keys(VALUE s, VALUE keys, bool name_only);
+static VALUE deconstruct_keys(VALUE s, VALUE keys, bool name_only, bool block_given);
 
 static int
 struct_hash_aset(VALUE key, VALUE val, struct struct_hash_set_arg *args, bool name_only)
@@ -1290,21 +1290,49 @@ rb_struct_to_a(VALUE s)
  */
 
 static VALUE
-rb_struct_to_h(VALUE s)
+struct_to_h_of(VALUE s, VALUE members, bool block_given)
 {
     VALUE h = rb_hash_new_capa(RSTRUCT_LEN_RAW(s));
-    VALUE members = rb_struct_members(s);
     rb_len_t i;
-    int block_given = rb_block_given_p();
+
+    if (!block_given) {
+        // Member names are distinct Symbols, so the pairs can go in without
+        // the per-key work of rb_hash_aset().
+        rb_len_t len = RSTRUCT_LEN_RAW(s);
+        if (rb_hash_fill_distinct_symbols(h, len, RARRAY_CONST_PTR(members), RSTRUCT_CONST_PTR(s))) {
+            // Filling a big table may allocate memory; the pointers above must stay put
+            RB_GC_GUARD(members);
+            RB_GC_GUARD(s);
+            return h;
+        }
+        VALUE buffer;
+        VALUE *pairs = ALLOCV_N(VALUE, buffer, len * 2);
+        for (i = 0; i < len; i++) {
+            pairs[i * 2] = RARRAY_AREF(members, i);
+            pairs[i * 2 + 1] = RSTRUCT_GET_RAW(s, i);
+        }
+        rb_hash_bulk_insert(len * 2, pairs, h);
+        ALLOCV_END(buffer);
+        return h;
+    }
 
     for (i=0; i<RSTRUCT_LEN_RAW(s); i++) {
         VALUE k = rb_ary_entry(members, i), v = RSTRUCT_GET_RAW(s, i);
-        if (block_given)
-            rb_hash_set_pair(h, rb_yield_values(2, k, v));
-        else
-            rb_hash_aset(h, k, v);
+        rb_hash_set_pair(h, rb_yield_values(2, k, v));
     }
     return h;
+}
+
+static VALUE
+struct_to_h(VALUE s, bool block_given)
+{
+    return struct_to_h_of(s, rb_struct_members(s), block_given);
+}
+
+static VALUE
+rb_struct_to_h(VALUE s)
+{
+    return struct_to_h(s, rb_block_given_p());
 }
 
 /*
@@ -1327,17 +1355,45 @@ rb_struct_to_h(VALUE s)
 static VALUE
 rb_struct_deconstruct_keys(VALUE s, VALUE keys)
 {
-    return deconstruct_keys(s, keys, false);
+    return deconstruct_keys(s, keys, false, rb_block_given_p());
+}
+
+#define DECONSTRUCT_SYMBOL_KEYS_MAX 8
+
+// What a pattern like `in {x:, y:}` asks for: a few Symbols, none given twice. Finding the
+// members runs no Ruby code, and such pairs can go into the empty +h+ without the per-key
+// work of rb_hash_aset(), like the ones of to_h. Returns false, with +h+ still empty, for
+// any other list of keys.
+static bool
+deconstruct_symbol_keys(VALUE s, VALUE keys, VALUE h)
+{
+    long len = RARRAY_LEN(keys), n;
+    if (len > DECONSTRUCT_SYMBOL_KEYS_MAX) return false;
+
+    VALUE names[DECONSTRUCT_SYMBOL_KEYS_MAX], values[DECONSTRUCT_SYMBOL_KEYS_MAX];
+    VALUE back = 0;
+    for (n = 0; n < len; n++) {
+        VALUE key = RARRAY_AREF(keys, n);
+        if (!SYMBOL_P(key)) return false;
+        for (long seen = 0; seen < n; seen++) {
+            if (names[seen] == key) return false;
+        }
+        int pos = struct_pos_cached(s, &key, false, &back);
+        if (pos < 0) break; // the Hash ends before the first name that is not a member
+        names[n] = key;
+        values[n] = RSTRUCT_GET_RAW(s, pos);
+    }
+    return rb_hash_fill_distinct_symbols(h, n, names, values);
 }
 
 static VALUE
-deconstruct_keys(VALUE s, VALUE keys, bool name_only)
+deconstruct_keys(VALUE s, VALUE keys, bool name_only, bool block_given)
 {
     VALUE h;
     rb_len_t i;
 
     if (NIL_P(keys)) {
-        return rb_struct_to_h(s);
+        return struct_to_h(s, block_given);
     }
     if (UNLIKELY(!RB_TYPE_P(keys, T_ARRAY))) {
         rb_raise(rb_eTypeError,
@@ -1349,9 +1405,13 @@ deconstruct_keys(VALUE s, VALUE keys, bool name_only)
         return rb_hash_new();
     }
     h = rb_hash_new_capa(RARRAY_LEN(keys));
+    if (deconstruct_symbol_keys(s, keys, h)) {
+        return h;
+    }
+    VALUE back = 0;
     for (i=0; i<RARRAY_LEN(keys); i++) {
         VALUE key = RARRAY_AREF(keys, i);
-        int i = rb_struct_pos(s, &key, name_only);
+        int i = struct_pos_cached(s, &key, name_only, &back);
         if (i < 0) {
             return h;
         }
@@ -2483,7 +2543,7 @@ rb_data_inspect(VALUE s)
 static VALUE
 rb_data_deconstruct_keys(VALUE s, VALUE keys)
 {
-    return deconstruct_keys(s, keys, true);
+    return deconstruct_keys(s, keys, true, rb_block_given_p());
 }
 
 /*
