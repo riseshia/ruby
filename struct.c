@@ -1633,8 +1633,8 @@ struct_equal_immutable_p(VALUE v)
 // Whether +s+ is a Data. Its members are fixed from the moment it exists, which
 // a frozen Struct cannot promise: a method called in the middle of comparing or
 // hashing it may have changed its members and frozen it.
-static bool
-struct_data_p(VALUE s)
+bool
+rb_struct_data_p(VALUE s)
 {
     return RTEST(rb_obj_is_kind_of(s, rb_cData));
 }
@@ -1645,7 +1645,7 @@ struct_equal_without_call(VALUE s, VALUE s2, VALUE (*opt_equal)(VALUE, VALUE))
     long len = RSTRUCT_LEN_RAW(s);
     const VALUE *ptr = RSTRUCT_CONST_PTR(s), *ptr2 = RSTRUCT_CONST_PTR(s2);
     // The caller has checked both are of the same class
-    bool frozen = struct_data_p(s);
+    bool frozen = rb_struct_data_p(s);
     for (long i = 0; i < len; i++) {
         VALUE v = ptr[i], v2 = ptr2[i];
         if (v == v2) continue;
@@ -1730,14 +1730,15 @@ rb_struct_equal(VALUE s, VALUE s2)
  *  Related: Object#hash.
  */
 
+// The hash of +s+, starting from +class_hash+: what rb_hash() makes of its class
 static VALUE
-rb_struct_hash(VALUE s)
+struct_hash(VALUE s, VALUE class_hash)
 {
     rb_len_t i, len;
     st_index_t h;
     VALUE n;
 
-    h = rb_hash_start(rb_hash(rb_obj_class(s)));
+    h = rb_hash_start(class_hash);
     len = RSTRUCT_LEN_RAW(s);
     for (i = 0; i < len; i++) {
         n = rb_hash(RSTRUCT_GET_RAW(s, i));
@@ -1745,6 +1746,22 @@ rb_struct_hash(VALUE s)
     }
     h = rb_hash_end(h);
     return ST2FIX(h);
+}
+
+VALUE
+rb_struct_hash(VALUE s)
+{
+    return struct_hash(s, rb_hash(rb_obj_class(s)));
+}
+
+VALUE rb_obj_hash(VALUE obj);
+
+// Struct#hash for hash.c, which found the hash of the class to be Kernel#hash:
+// what rb_hash() would call, without looking the method up again
+VALUE
+rb_struct_hash_of_basic_class(VALUE s)
+{
+    return struct_hash(s, rb_obj_hash(rb_obj_class(s)));
 }
 
 static VALUE
@@ -1794,6 +1811,23 @@ rb_struct_eql(VALUE s, VALUE s2)
     if (!UNDEF_P(result)) return result;
 
     return rb_exec_recursive_paired(recursive_eql, s, s2, s2);
+}
+
+// eql? of +s+ and +s2+ for a Hash matching +s+ against a key: Qtrue or Qfalse when the
+// Struct#eql? +s+ has settles it without calling a method, Qundef when it is not that
+// method, or would call one, or a TracePoint is watching C calls. The Hash then calls
+// eql? as it did, with its frame.
+VALUE
+rb_struct_eql_without_call(VALUE s, VALUE s2)
+{
+    if (ruby_vm_c_events_enabled > 0) return Qundef;
+    const rb_callable_method_entry_t *cme = rb_callable_method_entry(CLASS_OF(s), idEqlP);
+    if (!cme || cme->def->type != VM_METHOD_TYPE_CFUNC || cme->def->body.cfunc.func != (rb_cfunc_t)rb_struct_eql) {
+        return Qundef;
+    }
+    if (!RB_TYPE_P(s2, T_STRUCT)) return Qfalse;
+    if (RBASIC_CLASS(s) != RBASIC_CLASS(s2) && rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
+    return struct_equal_without_call(s, s2, rb_eql_opt);
 }
 
 /*
