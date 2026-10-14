@@ -1613,6 +1613,53 @@ rb_struct_select(int argc, VALUE *argv, VALUE s)
     return result;
 }
 
+// Compares the members as far as that needs no method call: Qtrue, Qfalse, or
+// Qundef when a call would be needed. Without a call nothing can re-enter the
+// comparison, so the recursion guard has nothing to catch. It answers Qtrue
+// both for equal structs and for a pair that is already being compared, so
+// Qtrue stands as is; Qfalse only stands when no comparison of the same pair
+// is in progress further up the stack, where it would compare as Qtrue.
+//
+// Such a comparison went through the members in the same order and got past
+// the pair that differs here, so that pair has changed since. That cannot
+// happen when both are Data, whose members never change, and both values are
+// frozen (Integer, Symbol, Float, frozen String), which saves looking the guard up.
+static inline bool
+struct_equal_immutable_p(VALUE v)
+{
+    return SPECIAL_CONST_P(v) || OBJ_FROZEN_RAW(v);
+}
+
+// Whether +s+ is a Data. Its members are fixed from the moment it exists, which
+// a frozen Struct cannot promise: a method called in the middle of comparing or
+// hashing it may have changed its members and frozen it.
+static bool
+struct_data_p(VALUE s)
+{
+    return RTEST(rb_obj_is_kind_of(s, rb_cData));
+}
+
+static VALUE
+struct_equal_without_call(VALUE s, VALUE s2, VALUE (*opt_equal)(VALUE, VALUE))
+{
+    long len = RSTRUCT_LEN_RAW(s);
+    const VALUE *ptr = RSTRUCT_CONST_PTR(s), *ptr2 = RSTRUCT_CONST_PTR(s2);
+    // The caller has checked both are of the same class
+    bool frozen = struct_data_p(s);
+    for (long i = 0; i < len; i++) {
+        VALUE v = ptr[i], v2 = ptr2[i];
+        if (v == v2) continue;
+
+        VALUE result = opt_equal(v, v2);
+        if (UNDEF_P(result)) return Qundef;
+        if (!RTEST(result)) {
+            if (frozen && struct_equal_immutable_p(v) && struct_equal_immutable_p(v2)) return Qfalse;
+            return Qundef;
+        }
+    }
+    return Qtrue;
+}
+
 static VALUE
 recursive_equal(VALUE s, VALUE s2, int recur)
 {
@@ -1652,10 +1699,14 @@ rb_struct_equal(VALUE s, VALUE s2)
 {
     if (s == s2) return Qtrue;
     if (!RB_TYPE_P(s2, T_STRUCT)) return Qfalse;
-    if (rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
+    // Instances without a singleton class mostly: the same klass is the same class
+    if (RBASIC_CLASS(s) != RBASIC_CLASS(s2) && rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
     if (RSTRUCT_LEN_RAW(s) != RSTRUCT_LEN_RAW(s2)) {
         rb_bug("inconsistent struct"); /* should never happen */
     }
+
+    VALUE result = struct_equal_without_call(s, s2, rb_equal_opt);
+    if (!UNDEF_P(result)) return result;
 
     return rb_exec_recursive_paired(recursive_equal, s, s2, s2);
 }
@@ -1733,10 +1784,14 @@ rb_struct_eql(VALUE s, VALUE s2)
 {
     if (s == s2) return Qtrue;
     if (!RB_TYPE_P(s2, T_STRUCT)) return Qfalse;
-    if (rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
+    // Instances without a singleton class mostly: the same klass is the same class
+    if (RBASIC_CLASS(s) != RBASIC_CLASS(s2) && rb_obj_class(s) != rb_obj_class(s2)) return Qfalse;
     if (RSTRUCT_LEN_RAW(s) != RSTRUCT_LEN_RAW(s2)) {
         rb_bug("inconsistent struct"); /* should never happen */
     }
+
+    VALUE result = struct_equal_without_call(s, s2, rb_eql_opt);
+    if (!UNDEF_P(result)) return result;
 
     return rb_exec_recursive_paired(recursive_eql, s, s2, s2);
 }
