@@ -2136,14 +2136,57 @@ rb_data_init_copy(VALUE copy, VALUE s)
  *
  */
 
+// A copy of +self+ with +kwargs+ applied, made without going through
+// initialize; Qundef when that could be told apart from calling it.
+// Every keyword is resolved before allocating: see rb_data_initialize_m()
+// about not leaving an unfrozen instance on the heap.
+static VALUE
+data_with_direct(VALUE self, VALUE kwargs)
+{
+    VALUE klass = rb_obj_class(self);
+    if (!data_initialize_unobservable_p(klass)) return Qundef;
+
+    struct keyword_positions arg;
+    if (!resolve_keyword_positions(klass, RSTRUCT_LEN_RAW(self), kwargs, &arg)) return Qundef;
+
+    long n = RSTRUCT_LEN_RAW(self);
+    VALUE copy = rb_obj_alloc(klass);
+    if (!RB_TYPE_P(copy, T_STRUCT) || RSTRUCT_LEN_RAW(copy) != n || OBJ_FROZEN(copy)) {
+        VALUE h = rb_struct_to_h(self);
+        rb_hash_update_by(h, kwargs, 0);
+        rb_obj_call_init_kw(copy, 1, &h, RB_PASS_KEYWORDS);
+        return copy;
+    }
+
+    for (long i = 0; i < n; i++) {
+        RSTRUCT_SET_RAW(copy, i, RSTRUCT_GET_RAW(self, i));
+    }
+    for (int i = 0; i < arg.count; i++) {
+        RSTRUCT_SET_RAW(copy, arg.positions[i], arg.values[i]);
+    }
+    OBJ_FREEZE(copy);
+    return copy;
+}
+
 static VALUE
 rb_data_with(int argc, const VALUE *argv, VALUE self)
 {
     VALUE kwargs;
-    rb_scan_args(argc, argv, "0:", &kwargs);
-    if (NIL_P(kwargs)) {
-        return self;
+    if (argc == 1 && rb_keyword_given_p()) {
+        // What rb_scan_args(argc, argv, "0:", &kwargs) settles on, without the copy it makes
+        // of the Hash: it is only read from here on.
+        kwargs = argv[0];
     }
+    else {
+        rb_scan_args(argc, argv, "0:", &kwargs);
+        if (NIL_P(kwargs)) {
+            return self;
+        }
+    }
+
+    // The regular path hands a block on to to_h, which then wants pairs from it
+    VALUE copy = rb_block_given_p() ? Qundef : data_with_direct(self, kwargs);
+    if (!UNDEF_P(copy)) return copy;
 
     VALUE h = rb_struct_to_h(self);
     rb_hash_update_by(h, kwargs, 0);
