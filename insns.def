@@ -229,6 +229,32 @@ setinstancevariable
     vm_setinstancevariable(GET_ISEQ(), GET_SELF(), id, val, ic);
 }
 
+/* Set member idx of self, a Struct, to val. Struct#initialize stores members with it. */
+DEFINE_INSN
+setstructmember
+(rb_num_t idx)
+(VALUE val)
+()
+// attr bool leaf = false; /* has rb_check_frozen() */
+// attr bool zjit_profile = true;
+{
+    vm_setstructmember(GET_SELF(), idx, val);
+}
+
+/* Allocate an instance of self, a Struct class, with num members from the
+ * stack, without calling new or #initialize. Struct.[] uses it. */
+DEFINE_INSN
+newstruct
+(rb_num_t num)
+(...)
+(VALUE val)
+// attr bool leaf = false; /* calls the allocator */
+// attr rb_snum_t sp_inc = 1 - (rb_snum_t)num;
+// attr bool zjit_profile = true;
+{
+    val = vm_newstruct(GET_SELF(), num, STACK_ADDR_FROM_TOP(num));
+}
+
 /* Get value of class variable id of klass as val. */
 DEFINE_INSN
 getclassvariable

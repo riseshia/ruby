@@ -1616,6 +1616,46 @@ vm_getinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, IVC ic)
     return vm_getivar(obj, id, iseq, ic, NULL, FALSE, Qnil);
 }
 
+static inline VALUE
+vm_newstruct(VALUE klass, rb_num_t num, const VALUE *argv)
+{
+    /* The instruction can come from a loaded ISEQ, so check what it makes. */
+    if (UNLIKELY(!RB_TYPE_P(klass, T_CLASS) || rb_class_inherited_p(klass, rb_cStruct) != Qtrue)) {
+        rb_raise(rb_eTypeError, "newstruct: %"PRIsVALUE" is not a Struct class", klass);
+    }
+    VALUE obj = rb_obj_alloc(klass);
+    if (UNLIKELY(!RB_TYPE_P(obj, T_STRUCT) || RSTRUCT_LEN_RAW(obj) < (long)num)) {
+        rb_raise(rb_eTypeError, "newstruct: %"PRIsVALUE" has fewer than %lu members", klass, (unsigned long)num);
+    }
+    for (rb_num_t i = 0; i < num; i++) {
+        RSTRUCT_SET_RAW(obj, (long)i, argv[i]);
+    }
+    return obj;
+}
+
+VALUE
+rb_vm_newstruct(VALUE klass, rb_num_t num, const VALUE *argv)
+{
+    return vm_newstruct(klass, num, argv);
+}
+
+static inline void
+vm_setstructmember(VALUE self, rb_num_t idx, VALUE val)
+{
+    /* The instruction can come from a loaded ISEQ, so check what it writes to. */
+    if (UNLIKELY(!RB_TYPE_P(self, T_STRUCT) || (rb_num_t)RSTRUCT_LEN_RAW(self) <= idx)) {
+        rb_raise(rb_eTypeError, "setstructmember: %"PRIsVALUE" has no member %lu", rb_obj_class(self), (unsigned long)idx);
+    }
+    rb_check_frozen(self);
+    RSTRUCT_SET_RAW(self, (long)idx, val);
+}
+
+void
+rb_vm_setstructmember(VALUE self, rb_num_t idx, VALUE val)
+{
+    vm_setstructmember(self, idx, val);
+}
+
 static inline void
 vm_setinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, VALUE val, IVC ic)
 {
@@ -4932,6 +4972,94 @@ NOINLINE(static VALUE vm_call_optimized(rb_execution_context_t *ec, rb_control_f
     }
 
 static VALUE
+vm_call_struct_init(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling)
+{
+    const rb_callable_method_entry_t *cme = rb_struct_init_target(CLASS_OF(calling->recv), calling->cd->ci);
+    calling->cc = &VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, cme);
+    return vm_call_method_each_type(ec, cfp, calling);
+}
+
+/* Same as vm_call_iseq_setup_normal_opt_start() on the positional ISEQ, for a
+ * positional-only call that rb_struct_init_pos_target_p() accepted. */
+static VALUE
+vm_call_struct_init_pos(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling)
+{
+    const rb_callable_method_entry_t *cme = rb_struct_pos_init_cme(CLASS_OF(calling->recv));
+    const struct rb_iseq_constant_body *body = ISEQ_BODY(def_iseq_ptr(cme->def));
+    const int argc = calling->argc;
+    return vm_call_iseq_setup_normal(ec, cfp, calling, cme, (int)body->param.opt_table[argc],
+                                     body->param.size - (body->param.opt_num - argc), body->local_table_size);
+}
+
+/*
+ * A splat call on a class with a positional ISEQ. The splatted Array, on the
+ * stack top, goes there when its values fit the members and the last one is
+ * not a ruby2_keywords Hash, which Struct takes as keywords.
+ */
+static VALUE
+vm_call_struct_init_splat(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling)
+{
+    const struct rb_callinfo *ci = calling->cd->ci;
+    VALUE recv = calling->recv, ary = *(cfp->sp - 1);
+    if (LIKELY(RB_TYPE_P(recv, T_STRUCT) && RB_TYPE_P(ary, T_ARRAY))) {
+        long len = RARRAY_LEN(ary);
+        VALUE last = len > 0 ? RARRAY_AREF(ary, len - 1) : Qnil;
+        if (calling->argc - 1 + len <= RSTRUCT_LEN_RAW(recv) &&
+            !(RB_TYPE_P(last, T_HASH) && FL_TEST_RAW(last, RHASH_PASS_AS_KEYWORDS))) {
+            CALLER_SETUP_ARG(cfp, calling, ci, (int)RSTRUCT_LEN_RAW(recv));
+            return vm_call_struct_init_pos(ec, cfp, calling);
+        }
+    }
+    calling->cc = &VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, rb_struct_generic_init_cme());
+    return vm_call_method_each_type(ec, cfp, calling);
+}
+
+/* A call with only a keyword splat: its keys, on the stack top, decide the target. */
+static VALUE
+vm_call_struct_init_kwsplat(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling)
+{
+    const rb_callable_method_entry_t *cme = rb_struct_init_kwsplat_target(calling->recv, *(cfp->sp - 1));
+    calling->cc = &VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, cme);
+    return vm_call_method_each_type(ec, cfp, calling);
+}
+
+/*
+ * Struct.[] with only positional arguments that fit: like the positional
+ * Struct#initialize, the choice depends only on what the call cache is keyed
+ * by, except for #initialize, which is checked on every call.
+ */
+static VALUE
+vm_call_struct_new_pos(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling)
+{
+    VALUE klass = calling->recv;
+    if (UNLIKELY(!rb_struct_new_iseq_p(klass))) {
+        calling->cc = &VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, rb_struct_new_c_cme(klass));
+        return vm_call_method_each_type(ec, cfp, calling);
+    }
+    const rb_callable_method_entry_t *cme = rb_struct_pos_new_cme(klass);
+    const struct rb_iseq_constant_body *body = ISEQ_BODY(def_iseq_ptr(cme->def));
+    const int argc = calling->argc;
+    return vm_call_iseq_setup_normal(ec, cfp, calling, cme, (int)body->param.opt_table[argc],
+                                     body->param.size - (body->param.opt_num - argc), body->local_table_size);
+}
+
+/* Struct.[] on a Struct class: see rb_struct_new_target(). */
+static VALUE
+vm_call_struct_new(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling)
+{
+    calling->cc = &VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, rb_struct_new_target(calling->recv, calling->cd->ci));
+    return vm_call_method_each_type(ec, cfp, calling);
+}
+
+/* A call with keywords to the positional ISEQ: the VM packs them into a Hash. */
+static VALUE
+vm_call_struct_init_pos_kw(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling)
+{
+    calling->cc = &VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, rb_struct_pos_init_cme(CLASS_OF(calling->recv)));
+    return vm_call_method_each_type(ec, cfp, calling);
+}
+
+static VALUE
 vm_call_optimized(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling,
                   const struct rb_callinfo *ci, const struct rb_callcache *cc)
 {
@@ -4967,6 +5095,37 @@ vm_call_optimized(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb
                             CC_SET_FASTPATH(cc, vm_call_opt_struct_aset, (vm_ci_flag(ci) & VM_CALL_ARGS_SIMPLE)))
         return v;
       }
+      case OPTIMIZED_METHOD_TYPE_STRUCT_INIT:
+        if (rb_struct_init_kwsplat_p(CLASS_OF(calling->recv), ci)) {
+            CC_SET_FASTPATH(cc, vm_call_struct_init_kwsplat, TRUE);
+            return vm_call_struct_init_kwsplat(ec, cfp, calling);
+        }
+        if (rb_struct_init_splat_shape_p(ci) && rb_struct_init_splat_class_p(CLASS_OF(calling->recv))) {
+            CC_SET_FASTPATH(cc, vm_call_struct_init_splat, TRUE);
+            return vm_call_struct_init_splat(ec, cfp, calling);
+        }
+        if (rb_struct_init_pos_target_p(CLASS_OF(calling->recv), ci)) {
+            if (vm_ci_flag(ci) & VM_CALL_KWARG) {
+                CC_SET_FASTPATH(cc, vm_call_struct_init_pos_kw, TRUE);
+                return vm_call_struct_init_pos_kw(ec, cfp, calling);
+            }
+            CC_SET_FASTPATH(cc, vm_call_struct_init_pos, TRUE);
+            return vm_call_struct_init_pos(ec, cfp, calling);
+        }
+        /* Other targets depend on the keyword names, which the call cache is
+         * not keyed by, so they are looked up on every call. */
+        CC_SET_FASTPATH(cc, vm_call_struct_init, TRUE);
+        return vm_call_struct_init(ec, cfp, calling);
+      case OPTIMIZED_METHOD_TYPE_STRUCT_NEW:
+        /* The target also depends on #initialize and the keyword names, so it
+         * is looked up on every call. */
+        if (!(vm_ci_flag(ci) & VM_CALL_KWARG) && rb_struct_init_pos_target_p(calling->recv, ci) &&
+            rb_struct_pos_new_cme(calling->recv)) {
+            CC_SET_FASTPATH(cc, vm_call_struct_new_pos, TRUE);
+            return vm_call_struct_new_pos(ec, cfp, calling);
+        }
+        CC_SET_FASTPATH(cc, vm_call_struct_new, TRUE);
+        return vm_call_struct_new(ec, cfp, calling);
       default:
         rb_bug("vm_call_method: unsupported optimized method type (%d)", vm_cc_cme(cc)->def->body.optimized.type);
     }

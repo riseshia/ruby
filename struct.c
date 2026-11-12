@@ -19,7 +19,11 @@
 #include "internal/struct.h"
 #include "internal/symbol.h"
 #include "vm_core.h"
+#include "vm_callinfo.h"
+#include "iseq.h"
 #include "builtin.h"
+
+rb_cref_t *rb_vm_cref_new_toplevel(void);
 
 /* only for struct[:field] access */
 enum {
@@ -33,8 +37,14 @@ enum {
 VALUE rb_cStruct;
 static VALUE rb_cData;
 static ID id_members, id_back_members, id_keyword_init;
+/* A Struct class keeps its ISEQ method entries in one hidden Array ivar,
+ * out of the method table, so the usual methods stay the only visible ones.
+ * These are the indexes into it. */
+static ID id_struct_cmes;
+enum { id_struct_pos_init, id_struct_kw_init, id_struct_pos_new, id_struct_kw_new, id_struct_new_c, STRUCT_CMES_LEN };
 
 static VALUE struct_alloc(VALUE);
+static void struct_define_kw_init(VALUE klass, VALUE members);
 
 static inline VALUE
 struct_ivar_get(VALUE c, ID id)
@@ -376,11 +386,24 @@ rb_struct_s_keyword_init_p(VALUE obj)
 
 #define rb_struct_s_keyword_init_p rb_struct_s_keyword_init
 
+static void struct_define_init_iseqs(VALUE klass);
+
+static void
+struct_reserve_init_ivars(VALUE klass)
+{
+    /* Class ivars are looked up from the newest one, and struct_alloc() looks
+     * up __members__ on every allocation, so add this before it. */
+    VALUE cmes = rb_ary_hidden_new(STRUCT_CMES_LEN);
+    for (int i = 0; i < STRUCT_CMES_LEN; i++) rb_ary_push(cmes, Qnil);
+    rb_ivar_set(klass, id_struct_cmes, cmes);
+}
+
 static VALUE
 setup_struct(VALUE nstr, VALUE members)
 {
     rb_len_t i, len;
 
+    struct_reserve_init_ivars(nstr);
     members = struct_set_members(nstr, members);
 
     rb_define_alloc_func(nstr, struct_alloc);
@@ -471,6 +494,7 @@ struct_define_without_accessor(VALUE outer, const char *class_name, VALUE super,
         klass = anonymous_struct(super);
     }
 
+    if (rb_class_inherited_p(klass, rb_cStruct) == Qtrue) struct_reserve_init_ivars(klass);
     struct_set_members(klass, members);
 
     if (alloc) {
@@ -479,6 +503,7 @@ struct_define_without_accessor(VALUE outer, const char *class_name, VALUE super,
     else {
         rb_define_alloc_func(klass, struct_alloc);
     }
+    if (rb_class_inherited_p(klass, rb_cStruct) == Qtrue) struct_define_init_iseqs(klass);
 
     return klass;
 }
@@ -526,7 +551,9 @@ rb_struct_define(const char *name, ...)
         st = new_struct(rb_str_new2(name), rb_cStruct);
         rb_vm_register_global_object(st);
     }
-    return setup_struct(st, ary);
+    setup_struct(st, ary);
+    struct_define_init_iseqs(st);
+    return st;
 }
 
 VALUE
@@ -539,7 +566,9 @@ rb_struct_define_under(VALUE outer, const char *name, ...)
     ary = struct_make_members_list(ar);
     va_end(ar);
 
-    return setup_struct(rb_define_class_id_under(outer, rb_intern(name), rb_cStruct), ary);
+    VALUE st = setup_struct(rb_define_class_id_under(outer, rb_intern(name), rb_cStruct), ary);
+    struct_define_init_iseqs(st);
+    return st;
 }
 
 /*
@@ -719,6 +748,7 @@ rb_struct_s_def(int argc, VALUE *argv, VALUE klass)
     }
     setup_struct(st, rest);
     rb_ivar_set(st, id_keyword_init, keyword_init);
+    struct_define_init_iseqs(st);
     if (rb_block_given_p()) {
         rb_mod_module_eval(0, 0, st);
     }
@@ -774,72 +804,572 @@ struct_hash_aset(VALUE key, VALUE val, struct struct_hash_set_arg *args, bool na
     return i;
 }
 
-static int
-struct_hash_set_i(VALUE key, VALUE val, VALUE arg)
+/*
+ * Struct#initialize is OPTIMIZED_METHOD_TYPE_STRUCT_INIT and has no body of
+ * its own. Each call goes to one of these ISEQ methods, chosen from the call
+ * shape by rb_struct_init_target():
+ *
+ *   positional  initialize(m0 = nil, ..., m(n-1) = nil)   defined per class
+ *   keyword     initialize(m0: nil, ..., m(n-1): nil)     defined per class
+ *   generic     initialize(*args, **kw)                   struct.rb
+ *
+ * A call mixing positional and keyword arguments goes to the positional
+ * ISEQ: it has no keyword parameters, so the VM passes the keywords as a
+ * trailing Hash, which is what Struct does with them. The generic ISEQ takes
+ * what the call site cannot decide (splats, calls without a call site such
+ * as send or rb_funcall) and the error cases.
+ */
+static const rb_callable_method_entry_t *struct_generic_init_cme;
+
+const rb_callable_method_entry_t *
+rb_struct_generic_init_cme(void)
 {
-    struct struct_hash_set_arg *args = (struct struct_hash_set_arg *)arg;
-    struct_hash_aset(key, val, args, false);
-    return ST_CONTINUE;
+    return struct_generic_init_cme;
+}
+
+static const rb_callable_method_entry_t *
+struct_init_cme(VALUE klass, int idx)
+{
+    VALUE cmes = struct_ivar_get(klass, id_struct_cmes);
+    VALUE cme = NIL_P(cmes) ? Qnil : RARRAY_AREF(cmes, idx);
+    return NIL_P(cme) ? NULL : (const rb_callable_method_entry_t *)cme;
+}
+
+static void
+struct_set_cme(VALUE klass, int idx, VALUE cme)
+{
+    rb_ary_store(rb_attr_get(klass, id_struct_cmes), idx, cme);
+}
+
+static bool
+struct_keywords_are_members(VALUE klass, const struct rb_callinfo_kwarg *kwarg)
+{
+    VALUE members = struct_ivar_get(klass, id_members);
+    for (int i = 0; i < kwarg->keyword_len; i++) {
+        if (!rb_ary_includes(members, kwarg->keywords[i])) return false;
+    }
+    return true;
+}
+
+/*
+ * The target of Struct#initialize for a call with ci on an instance of klass.
+ * Everything but the keyword names depends only on argc, flags and keyword
+ * count, which is what call caches are keyed by.
+ */
+const rb_callable_method_entry_t *
+rb_struct_init_target(VALUE klass, const struct rb_callinfo *ci)
+{
+    const rb_callable_method_entry_t *cme = NULL;
+    const struct rb_callinfo_kwarg *kwarg = vm_ci_kwarg(ci);
+    int argc = vm_ci_argc(ci);
+    int kw_len = kwarg ? kwarg->keyword_len : 0;
+
+    if (vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING)) {
+        return struct_generic_init_cme;
+    }
+
+    VALUE keyword_init = rb_struct_s_keyword_init(klass);
+    if (keyword_init == Qfalse) {
+        int npos = argc - kw_len + (kw_len > 0);
+        if (npos <= num_members(klass)) cme = struct_init_cme(klass, id_struct_pos_init);
+    }
+    else if (kw_len == argc) {
+        if (kw_len == 0 || struct_keywords_are_members(klass, kwarg)) {
+            cme = struct_init_cme(klass, id_struct_kw_init);
+        }
+    }
+    else if (NIL_P(keyword_init)) {
+        int npos = argc - kw_len + (kw_len > 0);
+        if (npos <= num_members(klass)) cme = struct_init_cme(klass, id_struct_pos_init);
+    }
+    return cme ? cme : struct_generic_init_cme;
+}
+
+/*
+ * The arrays and hashes given to rb_iseq_load() hold symbols of internal IDs,
+ * which cannot be inspected. Hide them so ObjectSpace never yields them.
+ */
+static VALUE
+iseq_hidden_ary(long capa)
+{
+    return rb_ary_hidden_new(capa);
 }
 
 static VALUE
-rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
+iseq_hidden_hash(void)
 {
-    VALUE klass = rb_obj_class(self);
-    rb_struct_modify(self);
-    rb_len_t n = RSTRUCT_LEN_RAW(self);
-    if (argc == 0) {
-        rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
-        return Qnil;
-    }
+    VALUE hash = rb_hash_new();
+    RBASIC_CLEAR_CLASS(hash);
+    return hash;
+}
 
-    bool keyword_init = false;
-    switch (rb_struct_s_keyword_init(klass)) {
-      default:
-        if (argc > 1 || !RB_TYPE_P(argv[0], T_HASH)) {
-            rb_error_arity(argc, 0, 0);
-        }
-        keyword_init = true;
-        break;
-      case Qfalse:
-        break;
-      case Qnil:
-        if (argc > 1 || !RB_TYPE_P(argv[0], T_HASH)) {
-            break;
-        }
-        keyword_init = rb_keyword_given_p();
-        break;
+static VALUE
+iseq_hidden_dup(VALUE ary)
+{
+    VALUE dup = rb_ary_hidden_new(RARRAY_LEN(ary));
+    rb_ary_concat(dup, ary);
+    return dup;
+}
+
+static VALUE
+iseq_hidden_from_args(long n, ...)
+{
+    VALUE ary = rb_ary_hidden_new(n);
+    va_list ap;
+    va_start(ap, n);
+    for (long i = 0; i < n; i++) rb_ary_push(ary, va_arg(ap, VALUE));
+    va_end(ap);
+    return ary;
+}
+
+/*
+ * Whether a call with ci on an instance of klass goes to the positional ISEQ.
+ * rb_struct_init_target() looks at keyword names only to pick the keyword
+ * ISEQ, so this depends only on klass, argc and flags, all of which the call
+ * cache is keyed by.
+ */
+bool
+rb_struct_init_pos_target_p(VALUE klass, const struct rb_callinfo *ci)
+{
+    const rb_callable_method_entry_t *pos = struct_init_cme(klass, id_struct_pos_init);
+    return pos && rb_struct_init_target(klass, ci) == pos;
+}
+
+/* Whether ci passes only a keyword splat, and klass has a keyword ISEQ for it. */
+bool
+rb_struct_init_kwsplat_p(VALUE klass, const struct rb_callinfo *ci)
+{
+    return (vm_ci_flag(ci) & VM_CALL_KW_SPLAT) && vm_ci_argc(ci) == 1 &&
+        !(vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING)) &&
+        struct_init_cme(klass, id_struct_kw_init);
+}
+
+static int
+struct_member_key_i(VALUE key, VALUE val, VALUE arg)
+{
+    VALUE *args = (VALUE *)arg; /* recv, bool *ok */
+    if (!SYMBOL_P(key) || struct_member_pos(args[0], key) < 0) {
+        *(bool *)args[1] = false;
+        return ST_STOP;
     }
-    if (keyword_init) {
-        struct struct_hash_set_arg arg = {
-            .self = self,
-        };
-        rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
-        rb_hash_foreach(argv[0], struct_hash_set_i, (VALUE)&arg);
-        if (UNLIKELY(arg.unknown_keywords)) {
-            rb_raise(rb_eArgError, "unknown keywords: %"PRIsVALUE,
-                     rb_ary_join(arg.unknown_keywords, rb_str_new2(", ")));
+    return ST_CONTINUE;
+}
+
+/*
+ * The target for a call of rb_struct_init_kwsplat_p() with hash. The keyword
+ * ISEQ takes it when every key is a member name; String or Integer keys and
+ * unknown keys go to the generic ISEQ, which has Struct's own rules for them.
+ */
+const rb_callable_method_entry_t *
+rb_struct_init_kwsplat_target(VALUE recv, VALUE hash)
+{
+    if (RB_TYPE_P(hash, T_HASH)) {
+        long n = RHASH_SIZE(hash);
+        if (n == 0) return struct_init_cme(rb_obj_class(recv), id_struct_kw_init);
+        if (n <= RSTRUCT_LEN_RAW(recv)) {
+            bool ok = true;
+            VALUE args[2] = { recv, (VALUE)&ok };
+            rb_hash_foreach(hash, struct_member_key_i, (VALUE)args);
+            if (ok) return struct_init_cme(rb_obj_class(recv), id_struct_kw_init);
         }
     }
-    else {
-        if (n < argc) {
-            rb_raise(rb_eArgError, "struct size differs");
-        }
-        for (rb_len_t i=0; i<argc; i++) {
-            RSTRUCT_SET_RAW(self, i, argv[i]);
-        }
-        if (n > argc) {
-            rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self)+argc, n-argc);
-        }
+    return struct_generic_init_cme;
+}
+
+/* Whether klass has a positional ISEQ that takes splat calls. */
+bool
+rb_struct_init_splat_class_p(VALUE klass)
+{
+    return rb_struct_s_keyword_init(klass) != Qtrue && struct_init_cme(klass, id_struct_pos_init);
+}
+
+/* Whether ci passes a splat and nothing else that needs the generic ISEQ. */
+bool
+rb_struct_init_splat_shape_p(const struct rb_callinfo *ci)
+{
+    return (vm_ci_flag(ci) & VM_CALL_ARGS_SPLAT) &&
+        !(vm_ci_flag(ci) & (VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING));
+}
+
+/*
+ * The target for a call of rb_struct_init_splat_shape_p(), given the splatted
+ * Array. The positional ISEQ takes it when the values fit the members and the
+ * last one is not a ruby2_keywords Hash, which Struct takes as keywords.
+ */
+const rb_callable_method_entry_t *
+rb_struct_init_splat_target(VALUE klass, const struct rb_callinfo *ci, VALUE splat)
+{
+    const rb_callable_method_entry_t *pos = struct_init_cme(klass, id_struct_pos_init);
+    if (!pos || !RB_TYPE_P(splat, T_ARRAY) || rb_struct_s_keyword_init(klass) == Qtrue) {
+        return struct_generic_init_cme;
     }
+    long len = RARRAY_LEN(splat);
+    if ((long)vm_ci_argc(ci) - 1 + len > num_members(klass)) return struct_generic_init_cme;
+    if (len > 0) {
+        VALUE last = RARRAY_AREF(splat, len - 1);
+        if (RB_TYPE_P(last, T_HASH) && FL_TEST_RAW(last, RHASH_PASS_AS_KEYWORDS)) return struct_generic_init_cme;
+    }
+    return pos;
+}
+
+const rb_callable_method_entry_t *
+rb_struct_pos_init_cme(VALUE klass)
+{
+    return struct_init_cme(klass, id_struct_pos_init);
+}
+
+/*
+ * Same as rb_struct_init_target() for a call without a call site (send,
+ * Method#call, rb_funcall), where only argc and whether the last argument
+ * is keywords are known.
+ */
+const rb_callable_method_entry_t *
+rb_struct_init_target_argc(VALUE recv, int argc, const VALUE *argv, int kw_splat)
+{
+    VALUE klass = rb_obj_class(recv);
+    const rb_callable_method_entry_t *cme = NULL;
+    if (kw_splat && argc == 1 && struct_init_cme(klass, id_struct_kw_init)) {
+        return rb_struct_init_kwsplat_target(recv, argv[0]);
+    }
+    if (!kw_splat && rb_struct_s_keyword_init(klass) != Qtrue && argc <= num_members(klass)) {
+        cme = struct_init_cme(klass, id_struct_pos_init);
+    }
+    return cme ? cme : struct_generic_init_cme;
+}
+
+struct iseq_ary_builder {
+    VALUE body;
+    long insn_count;
+    int local_size;
+};
+
+#define ISEQ_SYM(s) ID2SYM(rb_intern(s))
+
+static void
+iseq_insn(struct iseq_ary_builder *b, const char *name, int argc, ...)
+{
+    VALUE insn = iseq_hidden_ary(argc + 1);
+    rb_ary_push(insn, ISEQ_SYM(name));
+    va_list ap;
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) {
+        rb_ary_push(insn, va_arg(ap, VALUE));
+    }
+    va_end(ap);
+    rb_ary_push(b->body, insn);
+    b->insn_count++;
+}
+
+static VALUE
+iseq_label(long i)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "label_%ld", i);
+    return ISEQ_SYM(buf);
+}
+
+/* Local operand for getlocal/setlocal: index counted from the EP. */
+static VALUE
+iseq_lidx(struct iseq_ary_builder *b, long i)
+{
+    return INT2FIX(b->local_size - i + VM_ENV_DATA_SIZE - 1);
+}
+
+/* Store local j into member j, for every member. */
+static void
+iseq_store_members(struct iseq_ary_builder *b, long n)
+{
+    rb_ary_push(b->body, ISEQ_SYM("RUBY_EVENT_CALL"));
+    for (long j = 0; j < n; j++) {
+        iseq_insn(b, "getlocal_WC_0", 1, iseq_lidx(b, j));
+        iseq_insn(b, "setstructmember", 1, LONG2FIX(j));
+    }
+    iseq_insn(b, "putnil", 0);
+    rb_ary_push(b->body, ISEQ_SYM("RUBY_EVENT_RETURN"));
+    iseq_insn(b, "leave", 0);
+}
+
+static void
+struct_add_iseq(VALUE klass, int idx, ID name, VALUE owner, rb_method_visibility_t visi, int stack_max,
+                struct iseq_ary_builder *b, int arg_size, VALUE locals, VALUE params)
+{
+    VALUE node_ids = iseq_hidden_ary(b->insn_count);
+    for (long i = 0; i < b->insn_count; i++) rb_ary_push(node_ids, INT2FIX(0));
+
+    VALUE misc = iseq_hidden_hash();
+    rb_hash_aset(misc, ISEQ_SYM("arg_size"), INT2FIX(arg_size));
+    rb_hash_aset(misc, ISEQ_SYM("local_size"), INT2FIX(b->local_size));
+    rb_hash_aset(misc, ISEQ_SYM("stack_max"), INT2FIX(stack_max));
+    rb_hash_aset(misc, ISEQ_SYM("node_id"), INT2FIX(0));
+    rb_hash_aset(misc, ISEQ_SYM("node_ids"), node_ids);
+    rb_hash_aset(misc, ISEQ_SYM("parser"), ISEQ_SYM("prism"));
+
+    VALUE data = iseq_hidden_from_args(14,
+        rb_str_new_cstr("YARVInstructionSequence/SimpleDataFormat"),
+        INT2FIX(ISEQ_MAJOR_VERSION), INT2FIX(ISEQ_MINOR_VERSION), INT2FIX(1),
+        misc, rb_id2str(name), rb_str_new_cstr("<internal:struct>"), Qnil,
+        INT2FIX(1), ISEQ_SYM("method"), locals, params, iseq_hidden_ary(0), b->body);
+
+    const rb_iseq_t *iseq = rb_iseqw_to_iseq(rb_iseq_load(data, Qnil, Qnil));
+    /* Named and owned as the method it stands for, as TracePoint and backtraces show it. */
+    rb_method_definition_t *def = rb_method_definition_create(VM_METHOD_TYPE_ISEQ, name);
+    rb_method_entry_t *me = rb_method_entry_create(name, owner, visi, NULL);
+    rb_method_iseq_t body = { .iseqptr = iseq, .cref = rb_vm_cref_new_toplevel() };
+    rb_method_definition_set(me, def, &body);
+    struct_set_cme(klass, idx, (VALUE)me);
+}
+
+/* initialize(m0 = nil, ..., m(n-1) = nil) */
+static void
+struct_define_pos_init(VALUE klass, VALUE members)
+{
+    long n = RARRAY_LEN(members);
+    struct iseq_ary_builder b = { iseq_hidden_ary(0), 0, (int)n };
+    VALUE locals = iseq_hidden_dup(members);
+    VALUE opt = iseq_hidden_ary(n + 1);
+    for (long j = 0; j < n; j++) {
+        rb_ary_push(opt, iseq_label(j));
+        rb_ary_push(b.body, iseq_label(j));
+        iseq_insn(&b, "putnil", 0);
+        iseq_insn(&b, "setlocal_WC_0", 1, iseq_lidx(&b, j));
+    }
+    rb_ary_push(opt, iseq_label(n));
+    rb_ary_push(b.body, iseq_label(n));
+    iseq_store_members(&b, n);
+
+    VALUE params = iseq_hidden_hash();
+    rb_hash_aset(params, ISEQ_SYM("opt"), opt);
+    struct_add_iseq(klass, id_struct_pos_init, idInitialize, rb_cStruct, METHOD_VISI_PRIVATE, 2, &b, (int)n, locals, params);
+}
+
+/* initialize(m0: nil, ..., m(n-1): nil) */
+static void
+struct_define_kw_init(VALUE klass, VALUE members)
+{
+    long n = RARRAY_LEN(members);
+    /* locals: m0..m(n-1), kwbits */
+    struct iseq_ary_builder b = { iseq_hidden_ary(0), 0, (int)(n + 1) };
+    VALUE locals = iseq_hidden_dup(members);
+    rb_ary_push(locals, INT2FIX(0));
+    VALUE keywords = iseq_hidden_ary(n);
+    for (long j = 0; j < n; j++) {
+        rb_ary_push(keywords, rb_ary_new_from_args(2, RARRAY_AREF(members, j), Qnil));
+    }
+    iseq_store_members(&b, n);
+
+    VALUE params = iseq_hidden_hash();
+    rb_hash_aset(params, ISEQ_SYM("keyword"), keywords);
+    rb_hash_aset(params, ISEQ_SYM("kwbits"), LONG2FIX(n));
+    struct_add_iseq(klass, id_struct_kw_init, idInitialize, rb_cStruct, METHOD_VISI_PRIVATE, 2, &b, b.local_size, locals, params);
+}
+
+/* Build an instance of self from locals 0..n-1 and return it. */
+static void
+iseq_new_struct(struct iseq_ary_builder *b, long n)
+{
+    rb_ary_push(b->body, ISEQ_SYM("RUBY_EVENT_CALL"));
+    for (long j = 0; j < n; j++) {
+        iseq_insn(b, "getlocal_WC_0", 1, iseq_lidx(b, j));
+    }
+    iseq_insn(b, "newstruct", 1, LONG2FIX(n));
+    rb_ary_push(b->body, ISEQ_SYM("RUBY_EVENT_RETURN"));
+    iseq_insn(b, "leave", 0);
+}
+
+/*
+ * Struct.[] of klass, used only while klass has Struct#initialize, which
+ * would store the given members and nil for the rest. So these build the
+ * instance directly:
+ *
+ *   positional  [](m0 = nil, ..., m(n-1) = nil)
+ *   keyword     [](m0: nil, ..., m(n-1): nil)
+ */
+static void
+struct_define_new(VALUE klass, VALUE members, bool pos, bool kw)
+{
+    long n = RARRAY_LEN(members);
+    VALUE owner = rb_singleton_class(klass);
+    if (pos) {
+        struct iseq_ary_builder b = { iseq_hidden_ary(0), 0, (int)n };
+        VALUE locals = iseq_hidden_dup(members);
+        VALUE opt = iseq_hidden_ary(n + 1);
+        for (long j = 0; j < n; j++) {
+            rb_ary_push(opt, iseq_label(j));
+            rb_ary_push(b.body, iseq_label(j));
+            iseq_insn(&b, "putnil", 0);
+            iseq_insn(&b, "setlocal_WC_0", 1, iseq_lidx(&b, j));
+        }
+        rb_ary_push(opt, iseq_label(n));
+        rb_ary_push(b.body, iseq_label(n));
+        iseq_new_struct(&b, n);
+        VALUE params = iseq_hidden_hash();
+        rb_hash_aset(params, ISEQ_SYM("opt"), opt);
+        struct_add_iseq(klass, id_struct_pos_new, idAREF, owner, METHOD_VISI_PUBLIC, (int)n + 2, &b, (int)n, locals, params);
+    }
+    if (kw) {
+        struct iseq_ary_builder b = { iseq_hidden_ary(0), 0, (int)(n + 1) };
+        VALUE locals = iseq_hidden_dup(members);
+        rb_ary_push(locals, INT2FIX(0));
+        VALUE keywords = iseq_hidden_ary(n);
+        for (long j = 0; j < n; j++) {
+            rb_ary_push(keywords, rb_ary_new_from_args(2, RARRAY_AREF(members, j), Qnil));
+        }
+        iseq_new_struct(&b, n);
+        VALUE params = iseq_hidden_hash();
+        rb_hash_aset(params, ISEQ_SYM("keyword"), keywords);
+        rb_hash_aset(params, ISEQ_SYM("kwbits"), LONG2FIX(n));
+        struct_add_iseq(klass, id_struct_kw_new, idAREF, owner, METHOD_VISI_PUBLIC, (int)n + 2, &b, b.local_size, locals, params);
+    }
+}
+
+#undef ISEQ_SYM
+
+static void
+struct_define_init_iseqs(VALUE klass)
+{
+    /* Until struct.rb is loaded, every call goes to the generic ISEQ, which
+     * does not exist yet either; no Struct is initialized that early. */
+    if (!struct_generic_init_cme) return;
+
+    VALUE members = struct_ivar_get(klass, id_members);
+    VALUE keyword_init = rb_struct_s_keyword_init(klass);
+    long n = RARRAY_LEN(members);
+    if (n == 0) return;
+
+    bool pos = keyword_init != Qtrue;
+    bool kw = keyword_init != Qfalse && n <= VM_KW_SPECIFIED_BITS_MAX;
+    if (pos) struct_define_pos_init(klass, members);
+    if (kw) struct_define_kw_init(klass, members);
+
+    /* Struct.[] becomes a dispatcher too, when klass has the usual one. */
+    VALUE sclass = rb_singleton_class(klass);
+    const rb_method_entry_t *aref = rb_method_entry_at(sclass, idAREF);
+    if (aref && aref->def->type == VM_METHOD_TYPE_CFUNC &&
+        (void *)aref->def->body.cfunc.func == (void *)rb_class_new_instance_pass_kw) {
+        struct_set_cme(klass, id_struct_new_c, (VALUE)rb_method_entry_clone(aref));
+        struct_define_new(klass, members, pos, kw);
+        rb_add_method_optimized(sclass, idAREF, OPTIMIZED_METHOD_TYPE_STRUCT_NEW, 0, METHOD_VISI_PUBLIC);
+    }
+}
+
+/* The original Struct.[] of klass: allocate and call #initialize, from C. */
+const rb_callable_method_entry_t *
+rb_struct_new_c_cme(VALUE klass)
+{
+    return struct_init_cme(klass, id_struct_new_c);
+}
+
+/* The #initialize that Struct.[] of klass would call. */
+const rb_callable_method_entry_t *
+rb_struct_new_init_cme(VALUE klass)
+{
+    return rb_callable_method_entry(klass, idInitialize);
+}
+
+/*
+ * Whether Struct.[] of klass may use its ISEQs: #initialize is Struct's own,
+ * and no call event is traced, as the ISEQs do not call #initialize.
+ */
+bool
+rb_struct_new_iseq_p(VALUE klass)
+{
+    if (UNLIKELY(ruby_vm_event_enabled_global_flags & (RUBY_EVENT_CALL | RUBY_EVENT_C_CALL))) return false;
+    const rb_callable_method_entry_t *init = rb_struct_new_init_cme(klass);
+    return init && init->def->type == VM_METHOD_TYPE_OPTIMIZED &&
+        init->def->body.optimized.type == OPTIMIZED_METHOD_TYPE_STRUCT_INIT;
+}
+
+const rb_callable_method_entry_t *
+rb_struct_pos_new_cme(VALUE klass)
+{
+    return struct_init_cme(klass, id_struct_pos_new);
+}
+
+/*
+ * The target of Struct.[] for a call with ci on klass. The ISEQs pass every
+ * member to #initialize, so they are used only while that is Struct's own;
+ * they go where Struct#initialize would send the same call.
+ */
+const rb_callable_method_entry_t *
+rb_struct_new_target(VALUE klass, const struct rb_callinfo *ci)
+{
+    if (rb_struct_new_iseq_p(klass) && !(vm_ci_flag(ci) & VM_CALL_OPT_SEND)) {
+        const rb_callable_method_entry_t *target = rb_struct_init_target(klass, ci);
+        if (target == struct_init_cme(klass, id_struct_pos_init)) return struct_init_cme(klass, id_struct_pos_new);
+        if (target == struct_init_cme(klass, id_struct_kw_init)) return struct_init_cme(klass, id_struct_kw_new);
+    }
+    return rb_struct_new_c_cme(klass);
+}
+
+static VALUE
+struct_set_raw(rb_execution_context_t *ec, VALUE self, VALUE idx, VALUE val)
+{
+    long i = FIX2LONG(idx);
+    if (i < 0 || RSTRUCT_LEN_RAW(self) <= i) rb_bug("struct_set_raw: index %ld out of range", i);
+    RSTRUCT_SET_RAW(self, i, val);
+    return val;
+}
+
+static VALUE
+struct_symbol_p(rb_execution_context_t *ec, VALUE self, VALUE key)
+{
+    return RBOOL(SYMBOL_P(key));
+}
+
+static VALUE
+struct_string_p(rb_execution_context_t *ec, VALUE self, VALUE key)
+{
+    return RBOOL(RB_TYPE_P(key, T_STRING));
+}
+
+static VALUE
+struct_member_index(rb_execution_context_t *ec, VALUE self, VALUE sym)
+{
+    int i = struct_member_pos(self, sym);
+    return i < 0 ? Qnil : INT2FIX(i);
+}
+
+static VALUE
+struct_check_symbol(rb_execution_context_t *ec, VALUE self, VALUE str)
+{
+    return rb_check_symbol(&str);
+}
+
+static VALUE
+struct_num2len(rb_execution_context_t *ec, VALUE self, VALUE key)
+{
+    return LEN2NUM(NUM2LEN(key));
+}
+
+static VALUE
+struct_register_generic_init(rb_execution_context_t *ec, VALUE self)
+{
+    /* struct.rb has just defined Struct#initialize as the generic ISEQ. */
+    const rb_method_entry_t *me = rb_method_entry_at(rb_cStruct, idInitialize);
+    struct_generic_init_cme = (const rb_callable_method_entry_t *)rb_method_entry_clone(me);
+    rb_vm_register_global_object((VALUE)struct_generic_init_cme);
+    rb_add_method_optimized(rb_cStruct, idInitialize, OPTIMIZED_METHOD_TYPE_STRUCT_INIT, 0, METHOD_VISI_PRIVATE);
     return Qnil;
 }
 
 VALUE
 rb_struct_initialize(VALUE self, VALUE values)
 {
-    rb_struct_initialize_m(RARRAY_LENINT(values), RARRAY_CONST_PTR(values), self);
-    if (rb_obj_is_kind_of(self, rb_cData)) OBJ_FREEZE(self);
+    if (rb_obj_is_kind_of(self, rb_cData)) {
+        rb_struct_modify(self);
+        /* Marshal.load of a Data passes every member, in order. */
+        long n = RSTRUCT_LEN_RAW(self);
+        if (n < RARRAY_LEN(values)) rb_raise(rb_eArgError, "struct size differs");
+        for (long i = 0; i < n; i++) {
+            RSTRUCT_SET_RAW(self, i, i < RARRAY_LEN(values) ? RARRAY_AREF(values, i) : Qnil);
+        }
+        OBJ_FREEZE(self);
+    }
+    else {
+        rb_execution_context_t *ec = GET_EC();
+        rb_vm_call_kw(ec, self, idInitialize, RARRAY_LENINT(values), RARRAY_CONST_PTR(values),
+                      struct_generic_init_cme, RB_NO_KEYWORDS);
+    }
     RB_GC_GUARD(values);
     return Qnil;
 }
@@ -2305,7 +2835,7 @@ InitVM_Struct(void)
     rb_define_singleton_method(rb_cStruct, "members", rb_struct_s_members_m, 0);
 #endif
 
-    rb_define_method(rb_cStruct, "initialize", rb_struct_initialize_m, -1);
+    /* Struct#initialize is defined by struct.rb. */
     rb_define_method(rb_cStruct, "initialize_copy", rb_struct_init_copy, 1);
 
     rb_define_method(rb_cStruct, "==", rb_struct_equal, 1);
@@ -2363,6 +2893,8 @@ InitVM_Struct(void)
     rb_define_method(rb_cData, "with", rb_data_with, -1);
 }
 
+#include "struct.rbinc"
+
 #undef rb_intern
 void
 Init_Struct(void)
@@ -2370,6 +2902,7 @@ Init_Struct(void)
     id_members = rb_intern("__members__");
     id_back_members = rb_intern("__members_back__");
     id_keyword_init = rb_intern("__keyword_init__");
+    id_struct_cmes = rb_make_internal_id();
 
     InitVM(Struct);
 }

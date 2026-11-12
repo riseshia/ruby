@@ -176,6 +176,8 @@ enum method_optimized_type {
     OPTIMIZED_METHOD_TYPE_BLOCK_CALL,
     OPTIMIZED_METHOD_TYPE_STRUCT_AREF,
     OPTIMIZED_METHOD_TYPE_STRUCT_ASET,
+    OPTIMIZED_METHOD_TYPE_STRUCT_INIT,
+    OPTIMIZED_METHOD_TYPE_STRUCT_NEW,
     OPTIMIZED_METHOD_TYPE__MAX
 };
 
@@ -229,6 +231,8 @@ void rb_add_refined_method_entry(VALUE refined_class, ID mid);
 
 rb_method_entry_t *rb_method_entry_set(VALUE klass, ID mid, const rb_method_entry_t *, rb_method_visibility_t noex);
 rb_method_entry_t *rb_method_entry_create(ID called_id, VALUE klass, rb_method_visibility_t visi, rb_method_definition_t *def);
+rb_method_definition_t *rb_method_definition_create(rb_method_type_t type, ID mid);
+void rb_method_definition_set(const rb_method_entry_t *me, rb_method_definition_t *def, void *opts);
 
 const rb_method_entry_t *rb_method_entry_at(VALUE obj, ID id);
 
