@@ -7671,6 +7671,22 @@ fn gen_send_iseq(
         unsafe { get_cikw_keyword_len(kw_arg) }
     };
 
+    // A callee without keyword parameters takes the keywords as one trailing
+    // positional Hash, as setup_parameters_complex() does. From here on the
+    // call is treated as having that Hash in place of the keywords; the stack
+    // itself is rewritten after the last side exit.
+    let pack_kwargs = supplying_kws && !doing_kw_call && !iseq_has_rest && !splat_call && !kw_splat
+        && !arg_setup_block && !forwarding && !proxy_recv && flags & VM_CALL_ARGS_BLOCKARG == 0
+        && !unsafe { rb_get_iseq_flags_ruby2_keywords(iseq) }
+        && !unsafe { get_iseq_flags_accepts_no_kwarg(iseq) };
+    let packed_kw_len = if pack_kwargs { kw_arg_num } else { 0 };
+    let (supplying_kws, kw_arg, kw_arg_num) = if pack_kwargs {
+        argc = argc - packed_kw_len + 1;
+        (false, std::ptr::null(), 0)
+    } else {
+        (supplying_kws, kw_arg, kw_arg_num)
+    };
+
     // Arity handling and optional parameter setup for positional arguments.
     // Splats are handled later.
     let mut opts_filled = argc - required_num - kw_arg_num - i32::from(kw_splat) - i32::from(splat_call);
@@ -7843,8 +7859,8 @@ fn gen_send_iseq(
     let builtin_func_raw = unsafe { rb_yjit_builtin_function(iseq) };
     let builtin_func = if builtin_func_raw.is_null() { None } else { Some(builtin_func_raw) };
     let opt_send_call = flags & VM_CALL_OPT_SEND != 0; // .send call is not currently supported for builtins
-    if let (None, Some(builtin_info), true, false, None | Some(0)) =
-           (block, builtin_func, builtin_attrs & BUILTIN_ATTR_LEAF != 0, opt_send_call, splat_array_length) {
+    if let (None, Some(builtin_info), true, false, None | Some(0), false) =
+           (block, builtin_func, builtin_attrs & BUILTIN_ATTR_LEAF != 0, opt_send_call, splat_array_length, pack_kwargs) {
         let builtin_argc = unsafe { (*builtin_info).argc };
         if builtin_argc + 1 < (C_ARG_OPNDS.len() as i32) {
             // We pop the block arg without using it because:
@@ -7901,7 +7917,7 @@ fn gen_send_iseq(
     }
 
     // Inline simple ISEQs whose return value is known at compile time
-    if let (Some(value), None, false) = (iseq_get_return_value(iseq, captured_opnd, block, flags), block_arg_type, opt_send_call) {
+    if let (Some(value), None, false, false) = (iseq_get_return_value(iseq, captured_opnd, block, flags), block_arg_type, opt_send_call, pack_kwargs) {
         asm_comment!(asm, "inlined simple ISEQ");
         gen_counter_incr(jit, asm, Counter::num_send_iseq_inline);
 
@@ -7947,6 +7963,21 @@ fn gen_send_iseq(
     let stack_limit = asm.lea(asm.ctx.sp_opnd(locals_offs));
     asm.cmp(CFP, stack_limit);
     asm.jbe(Target::side_exit(Counter::guard_send_se_cf_overflow));
+
+    if pack_kwargs {
+        asm_comment!(asm, "pack keyword arguments into a Hash");
+        let imemo_ci = VALUE(ci as usize);
+        assert_ne!(0, unsafe { rb_IMEMO_TYPE_P(imemo_ci, imemo_callinfo) },
+            "we assume all callinfos with kwargs are on the GC heap");
+        // We are going to allocate so setting pc and sp.
+        jit_save_pc(jit, asm);
+        gen_save_sp(asm);
+        let sp = asm.lea(asm.ctx.sp_opnd(0));
+        let hash = asm.ccall(build_kwhash as *const u8, vec![imemo_ci.into(), sp]);
+        asm.stack_pop(packed_kw_len as usize);
+        let hash_opnd = asm.stack_push(Type::THash);
+        asm.mov(hash_opnd, hash);
+    }
 
     // Remove the block param proxy receiver from the stack, mirroring vm_invoke_block_opt_call
     if proxy_recv {
