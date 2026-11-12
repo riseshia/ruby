@@ -87,6 +87,8 @@ fn profile_insn_sample(
         YARVINSN_opt_not   => profile_operands(profiler, profile, 1),
         YARVINSN_getinstancevariable => profile_self(profiler, profile),
         YARVINSN_setinstancevariable => profile_self(profiler, profile),
+        YARVINSN_setstructmember => profile_self(profiler, profile),
+        YARVINSN_newstruct => profile_self(profiler, profile),
         YARVINSN_definedivar   => profile_self(profiler, profile),
         YARVINSN_opt_regexpmatch2    => profile_operands(profiler, profile, 2),
         YARVINSN_objtostring   => profile_operands(profiler, profile, 1),

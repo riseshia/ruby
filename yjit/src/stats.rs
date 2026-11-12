@@ -405,6 +405,7 @@ make_counters! {
     send_bmethod_ractor,
     send_bmethod_block_arg,
     send_optimized_block_arg,
+    setstructmember_megamorphic,
     send_pred_not_fixnum,
     send_pred_underflow,
     send_str_dup_exivar,

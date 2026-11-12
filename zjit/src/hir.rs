@@ -709,6 +709,13 @@ impl From<u32> for MethodType {
     }
 }
 
+unsafe extern "C" {
+    fn rb_struct_init_target(klass: VALUE, ci: *const rb_callinfo) -> *const rb_callable_method_entry_t;
+    fn rb_struct_generic_init_cme() -> *const rb_callable_method_entry_t;
+    fn rb_struct_new_target(klass: VALUE, ci: *const rb_callinfo) -> *const rb_callable_method_entry_t;
+    fn rb_struct_new_init_cme(klass: VALUE) -> *const rb_callable_method_entry_t;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OptimizedMethodType {
     Send,
@@ -716,6 +723,8 @@ pub enum OptimizedMethodType {
     BlockCall,
     StructAref,
     StructAset,
+    StructInit,
+    StructNew,
 }
 
 impl From<u32> for OptimizedMethodType {
@@ -726,6 +735,8 @@ impl From<u32> for OptimizedMethodType {
             OPTIMIZED_METHOD_TYPE_BLOCK_CALL => OptimizedMethodType::BlockCall,
             OPTIMIZED_METHOD_TYPE_STRUCT_AREF => OptimizedMethodType::StructAref,
             OPTIMIZED_METHOD_TYPE_STRUCT_ASET => OptimizedMethodType::StructAset,
+            OPTIMIZED_METHOD_TYPE_STRUCT_INIT => OptimizedMethodType::StructInit,
+            OPTIMIZED_METHOD_TYPE_STRUCT_NEW => OptimizedMethodType::StructNew,
             _ => unreachable!("unknown send_without_block optimized method type: {}", value),
         }
     }
@@ -5040,6 +5051,27 @@ impl Function {
                         while def_type == VM_METHOD_TYPE_ALIAS {
                             cme = unsafe { rb_aliased_callable_method_entry(cme) };
                             def_type = unsafe { get_cme_def_type(cme) };
+                        }
+                        // Struct#initialize picks its body from the call shape, which is fixed here.
+                        if def_type == VM_METHOD_TYPE_OPTIMIZED
+                            && unsafe { get_cme_def_body_optimized_type(cme) } == OPTIMIZED_METHOD_TYPE_STRUCT_INIT {
+                            cme = unsafe {
+                                if vm_ci_flag(ci) & VM_CALL_OPT_SEND != 0 { rb_struct_generic_init_cme() } else { rb_struct_init_target(klass, ci) }
+                            };
+                            def_type = unsafe { get_cme_def_type(cme) };
+                        }
+                        // Struct.[] picks its body from the call shape and #initialize.
+                        if def_type == VM_METHOD_TYPE_OPTIMIZED
+                            && unsafe { get_cme_def_body_optimized_type(cme) } == OPTIMIZED_METHOD_TYPE_STRUCT_NEW
+                            && unsafe { rb_zjit_singleton_class_p(klass) } {
+                            let struct_class = unsafe { rb_class_attached_object(klass) };
+                            cme = unsafe { rb_struct_new_target(struct_class, ci) };
+                            def_type = unsafe { get_cme_def_type(cme) };
+                            if def_type == VM_METHOD_TYPE_ISEQ {
+                                // The ISEQs are used only while #initialize is Struct's own.
+                                let init_cme = unsafe { rb_struct_new_init_cme(struct_class) };
+                                self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass: struct_class, method: unsafe { (*init_cme).called_id }, cme: init_cme }, state });
+                            }
                         }
 
                         // Check if we can optimize `foo(&block)` to a direct send: either `block` is
@@ -9470,6 +9502,10 @@ fn add_iseq_to_hir(
                 profiles.profile_self(exit_id, &exit_state, self_param);
             } else if opcode == YARVINSN_definedivar || opcode == YARVINSN_trace_definedivar {
                 profiles.profile_self(exit_id, &exit_state, self_param);
+            } else if opcode == YARVINSN_newstruct || opcode == YARVINSN_trace_newstruct {
+                profiles.profile_self(exit_id, &exit_state, self_param);
+            } else if opcode == YARVINSN_setstructmember || opcode == YARVINSN_trace_setstructmember {
+                profiles.profile_self(exit_id, &exit_state, self_param);
             } else if opcode == YARVINSN_invokeblock || opcode == YARVINSN_trace_invokeblock {
                 if get_option!(stats) {
                     let iseq_insn_idx = exit_state.insn_idx;
@@ -10921,6 +10957,68 @@ fn add_iseq_to_hir(
                     // SetIvar will raise if self is an immediate. If it raises, we will have
                     // exited JIT code. So upgrade the type within JIT code to a heap object.
                     self_param = fun.push_insn(block, Insn::RefineType { val: unrefined_self_param, new_type: types::HeapBasicObject });
+                }
+                YARVINSN_newstruct => {
+                    let num = get_arg(pc, 0).as_usize();
+                    let vals = state.stack_pop_n(num)?;
+                    // self is the Struct class; when inlined it is usually a known constant.
+                    let known = fun.type_of(self_param).ruby_object();
+                    let struct_class = known.or_else(|| {
+                        let summary = fun.profile_summary(&profiles, self_param, exit_id);
+                        let pt = if summary.is_monomorphic() { Some(summary.bucket(0)) } else { None };
+                        pt.filter(|pt| unsafe { rb_zjit_singleton_class_p(pt.class()) }).map(|pt| {
+                            self_param = fun.guard_type_recompile(block, self_param, Type::from_profiled_type(pt), exit_id, Recompile);
+                            unsafe { rb_class_attached_object(pt.class()) }
+                        })
+                    });
+                    let struct_class = struct_class.filter(|&c| unsafe {
+                        RB_TYPE_P(c, RUBY_T_CLASS) && rb_class_inherited_p(c, rb_cStruct) == Qtrue
+                            && rb_zjit_struct_num_members(c) as usize == num
+                            && rb_zjit_struct_embedded_p(num as rb_len_t)
+                    });
+                    let Some(struct_class) = struct_class else {
+                        fun.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(SideExitReason::UnhandledYARVInsn(opcode)), recompile: None });
+                        break;
+                    };
+                    let obj = fun.push_insn(block, Insn::ObjectAlloc { val: self_param, state: exit_id });
+                    for (i, &val) in vals.iter().enumerate() {
+                        let id = unsafe { rb_zjit_struct_member_id(struct_class, i as rb_len_t) }.into();
+                        let offset = RUBY_OFFSET_RSTRUCT_AS_ARY + SIZEOF_VALUE_I32 * i as i32;
+                        fun.push_insn(block, Insn::StoreField { recv: obj, id, offset, val, num_bits: types::BasicObject.num_bits() });
+                        fun.write_barrier(block, obj, val);
+                    }
+                    state.stack_push(obj);
+                }
+                YARVINSN_setstructmember => {
+                    let idx = get_arg(pc, 0).as_u64();
+                    let val = state.stack_pop()?;
+                    // When inlined, self's class is usually known already; otherwise use the profile.
+                    let known_class = fun.type_of(self_param).exact_ruby_class();
+                    let class = known_class.or_else(|| {
+                        let summary = fun.profile_summary(&profiles, self_param, exit_id);
+                        let pt = if summary.is_monomorphic() { Some(summary.bucket(0)) } else { None };
+                        // Embedded implies T_STRUCT, so the class has members.
+                        pt.filter(|pt| pt.flags().is_struct_embedded()).map(|pt| {
+                            self_param = fun.guard_type_recompile(block, self_param, Type::from_profiled_type(pt), exit_id, Recompile);
+                            pt.class()
+                        })
+                    });
+                    // Structs of one class share members and embeddedness.
+                    let class = class.filter(|&class| unsafe {
+                        rb_class_inherited_p(class, rb_cStruct) == Qtrue
+                            && (idx as i64) < rb_zjit_struct_num_members(class) as i64
+                            && rb_zjit_struct_embedded_p(rb_zjit_struct_num_members(class))
+                    });
+                    let Some(class) = class else {
+                        fun.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(SideExitReason::UnhandledYARVInsn(opcode)), recompile: None });
+                        break;
+                    };
+                    fun.guard_not_frozen(block, self_param, exit_id);
+                    // Name the slot after its member so the store lines up with the reader's LoadField.
+                    let id = unsafe { rb_zjit_struct_member_id(class, idx as rb_len_t) }.into();
+                    let offset = RUBY_OFFSET_RSTRUCT_AS_ARY + SIZEOF_VALUE_I32 * idx as i32;
+                    fun.push_insn(block, Insn::StoreField { recv: self_param, id, offset, val, num_bits: types::BasicObject.num_bits() });
+                    fun.write_barrier(block, self_param, val);
                 }
                 YARVINSN_getclassvariable => {
                     let id = ID(get_arg(pc, 0).as_u64());

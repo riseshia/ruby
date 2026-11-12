@@ -3158,6 +3158,82 @@ fn gen_write_iv(
     }
 }
 
+unsafe extern "C" {
+    fn rb_vm_setstructmember(obj: VALUE, idx: u64, val: VALUE);
+    fn rb_vm_newstruct(klass: VALUE, num: u64, argv: *const VALUE) -> VALUE;
+}
+
+fn gen_newstruct(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+) -> Option<CodegenStatus> {
+    let num = jit.get_arg(0).as_u64();
+    // Allocates, and raises TypeError for an ISEQ that was not made by Struct.
+    jit_prepare_non_leaf_call(jit, asm);
+    let values_ptr = if num == 0 {
+        Opnd::UImm(0)
+    } else {
+        asm.lea(asm.ctx.sp_opnd(-(num as i32)))
+    };
+    let obj = asm.ccall(rb_vm_newstruct as *const u8, vec![Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SELF), num.into(), values_ptr]);
+    asm.stack_pop(num as usize);
+    let top = asm.stack_push(Type::UnknownHeap);
+    asm.mov(top, obj);
+    Some(KeepCompiling)
+}
+
+fn gen_setstructmember(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+) -> Option<CodegenStatus> {
+    // Defer compilation so we can specialize on a runtime `self`
+    if !jit.at_compile_target() {
+        return jit.defer_compilation(asm);
+    }
+
+    let idx = jit.get_arg(0).as_u64();
+    let comptime_self = jit.peek_at_self();
+    let inline = !comptime_self.special_const_p()
+        && unsafe { RB_TYPE_P(comptime_self, RUBY_T_STRUCT) }
+        && idx < unsafe { RSTRUCT_LEN(comptime_self) } as u64
+        && !comptime_self.is_frozen()
+        && (idx as i64) * (SIZEOF_VALUE as i64) <= (i32::MAX as i64);
+    if !inline {
+        // Raises FrozenError, or TypeError for an ISEQ that was not made by Struct.
+        jit_prepare_non_leaf_call(jit, asm);
+        let val = asm.stack_opnd(0);
+        asm.ccall(rb_vm_setstructmember as *const u8, vec![Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SELF), idx.into(), val]);
+        asm.stack_pop(1);
+        return Some(KeepCompiling);
+    }
+
+    // Structs of the same class have the same members and embeddedness.
+    let self_opnd = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SELF));
+    jit_guard_known_klass(jit, asm, self_opnd, SelfOpnd, comptime_self, SET_IVAR_MAX_DEPTH, Counter::setstructmember_megamorphic);
+    let recv = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SELF));
+    let flags = asm.load(Opnd::mem(VALUE_BITS, recv, RUBY_OFFSET_RBASIC_FLAGS));
+    asm.test(flags, (RUBY_FL_FREEZE as u64).into());
+    asm.jnz(Target::side_exit(Counter::opt_aset_frozen));
+
+    let off = idx as i32;
+    let embedded = unsafe { FL_TEST_RAW(comptime_self, VALUE(RSTRUCT_EMBED_LEN_MASK)) };
+    let val_is_imm = asm.ctx.get_opnd_type(StackOpnd(0)).is_imm();
+    asm_comment!(asm, "setstructmember");
+    let val = asm.stack_opnd(0);
+    let slot = if embedded != VALUE(0) {
+        Opnd::mem(64, recv, RUBY_OFFSET_RSTRUCT_AS_ARY + (SIZEOF_VALUE_I32 * off))
+    } else {
+        let rstruct_ptr = asm.load(Opnd::mem(64, recv, RUBY_OFFSET_RSTRUCT_AS_HEAP_PTR));
+        Opnd::mem(64, rstruct_ptr, SIZEOF_VALUE_I32 * off)
+    };
+    asm.mov(slot, val);
+    if !val_is_imm {
+        gen_trigger_wb(asm, recv, val);
+    }
+    asm.stack_pop(1);
+    Some(KeepCompiling)
+}
+
 fn gen_setinstancevariable(
     jit: &mut JITState,
     asm: &mut Assembler,
@@ -9235,6 +9311,15 @@ fn gen_send_dynamic<F: Fn(&mut Assembler) -> Opnd>(
     jump_to_next_insn(jit, asm)
 }
 
+unsafe extern "C" {
+    fn rb_struct_init_target(klass: VALUE, ci: *const rb_callinfo) -> *const rb_callable_method_entry_t;
+    fn rb_struct_generic_init_cme() -> *const rb_callable_method_entry_t;
+    fn rb_struct_init_splat_shape_p(ci: *const rb_callinfo) -> bool;
+    fn rb_struct_new_target(klass: VALUE, ci: *const rb_callinfo) -> *const rb_callable_method_entry_t;
+    fn rb_struct_new_init_cme(klass: VALUE) -> *const rb_callable_method_entry_t;
+    fn rb_struct_init_splat_target(klass: VALUE, ci: *const rb_callinfo, splat: VALUE) -> *const rb_callable_method_entry_t;
+}
+
 fn gen_send_general(
     jit: &mut JITState,
     asm: &mut Assembler,
@@ -9644,6 +9729,34 @@ fn gen_send_general(
                             flags,
                             argc,
                         );
+                    }
+                    OPTIMIZED_METHOD_TYPE_STRUCT_NEW => {
+                        // Struct.[] picks its body from the call shape and #initialize.
+                        let target = unsafe { rb_struct_new_target(comptime_recv, ci) };
+                        if unsafe { get_cme_def_type(target) } == VM_METHOD_TYPE_ISEQ {
+                            // The ISEQs are used only while #initialize is Struct's own.
+                            jit.assume_method_lookup_stable(asm, unsafe { rb_struct_new_init_cme(comptime_recv) });
+                        }
+                        cme = target;
+                        jit.assume_method_lookup_stable(asm, cme);
+                        continue;
+                    }
+                    OPTIMIZED_METHOD_TYPE_STRUCT_INIT => {
+                        // Struct#initialize picks its body from the call shape, which is fixed here.
+                        // Through send, ci still counts the method name, so it is not this call's shape.
+                        cme = unsafe {
+                            if flags & VM_CALL_OPT_SEND != 0 {
+                                rb_struct_generic_init_cme()
+                            } else if rb_struct_init_splat_shape_p(ci) {
+                                // gen_send_iseq() guards the splat length and ruby2_keywords flag
+                                // seen here; a different Array exits to the interpreter's choice.
+                                rb_struct_init_splat_target(comptime_recv_klass, ci, jit.peek_at_stack(&asm.ctx, 0))
+                            } else {
+                                rb_struct_init_target(comptime_recv_klass, ci)
+                            }
+                        };
+                        jit.assume_method_lookup_stable(asm, cme);
+                        continue;
                     }
                     _ => {
                         panic!("unknown optimized method type!")
@@ -11003,6 +11116,8 @@ fn get_gen_fn(opcode: VALUE) -> Option<InsnGenFn> {
         YARVINSN_concatstrings => Some(gen_concatstrings),
         YARVINSN_getinstancevariable => Some(gen_getinstancevariable),
         YARVINSN_setinstancevariable => Some(gen_setinstancevariable),
+        YARVINSN_setstructmember => Some(gen_setstructmember),
+        YARVINSN_newstruct => Some(gen_newstruct),
 
         YARVINSN_opt_eq => Some(gen_opt_eq),
         YARVINSN_opt_neq => Some(gen_opt_neq),
