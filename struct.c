@@ -774,72 +774,77 @@ struct_hash_aset(VALUE key, VALUE val, struct struct_hash_set_arg *args, bool na
     return i;
 }
 
-static int
-struct_hash_set_i(VALUE key, VALUE val, VALUE arg)
+/* Struct#initialize as struct.rb defines it, for rb_struct_initialize(). */
+static const rb_callable_method_entry_t *struct_init_cme;
+
+static VALUE
+struct_set_raw(rb_execution_context_t *ec, VALUE self, VALUE idx, VALUE val)
 {
-    struct struct_hash_set_arg *args = (struct struct_hash_set_arg *)arg;
-    struct_hash_aset(key, val, args, false);
-    return ST_CONTINUE;
+    long i = FIX2LONG(idx);
+    if (i < 0 || RSTRUCT_LEN_RAW(self) <= i) rb_bug("struct_set_raw: index %ld out of range", i);
+    RSTRUCT_SET_RAW(self, i, val);
+    return val;
 }
 
 static VALUE
-rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
+struct_symbol_p(rb_execution_context_t *ec, VALUE self, VALUE key)
 {
-    VALUE klass = rb_obj_class(self);
-    rb_struct_modify(self);
-    rb_len_t n = RSTRUCT_LEN_RAW(self);
-    if (argc == 0) {
-        rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
-        return Qnil;
-    }
+    return RBOOL(SYMBOL_P(key));
+}
 
-    bool keyword_init = false;
-    switch (rb_struct_s_keyword_init(klass)) {
-      default:
-        if (argc > 1 || !RB_TYPE_P(argv[0], T_HASH)) {
-            rb_error_arity(argc, 0, 0);
-        }
-        keyword_init = true;
-        break;
-      case Qfalse:
-        break;
-      case Qnil:
-        if (argc > 1 || !RB_TYPE_P(argv[0], T_HASH)) {
-            break;
-        }
-        keyword_init = rb_keyword_given_p();
-        break;
-    }
-    if (keyword_init) {
-        struct struct_hash_set_arg arg = {
-            .self = self,
-        };
-        rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self), n);
-        rb_hash_foreach(argv[0], struct_hash_set_i, (VALUE)&arg);
-        if (UNLIKELY(arg.unknown_keywords)) {
-            rb_raise(rb_eArgError, "unknown keywords: %"PRIsVALUE,
-                     rb_ary_join(arg.unknown_keywords, rb_str_new2(", ")));
-        }
-    }
-    else {
-        if (n < argc) {
-            rb_raise(rb_eArgError, "struct size differs");
-        }
-        for (rb_len_t i=0; i<argc; i++) {
-            RSTRUCT_SET_RAW(self, i, argv[i]);
-        }
-        if (n > argc) {
-            rb_mem_clear((VALUE *)RSTRUCT_CONST_PTR(self)+argc, n-argc);
-        }
-    }
+static VALUE
+struct_string_p(rb_execution_context_t *ec, VALUE self, VALUE key)
+{
+    return RBOOL(RB_TYPE_P(key, T_STRING));
+}
+
+static VALUE
+struct_member_index(rb_execution_context_t *ec, VALUE self, VALUE sym)
+{
+    int i = struct_member_pos(self, sym);
+    return i < 0 ? Qnil : INT2FIX(i);
+}
+
+static VALUE
+struct_check_symbol(rb_execution_context_t *ec, VALUE self, VALUE str)
+{
+    return rb_check_symbol(&str);
+}
+
+static VALUE
+struct_num2len(rb_execution_context_t *ec, VALUE self, VALUE key)
+{
+    return LEN2NUM(NUM2LEN(key));
+}
+
+static VALUE
+struct_init_loaded(rb_execution_context_t *ec, VALUE self)
+{
+    /* Keep it even if Struct#initialize is redefined later, as the C
+     * function rb_struct_initialize() used to call was not affected. */
+    const rb_method_entry_t *me = rb_method_entry_at(rb_cStruct, idInitialize);
+    struct_init_cme = (const rb_callable_method_entry_t *)rb_method_entry_clone(me);
+    rb_vm_register_global_object((VALUE)struct_init_cme);
     return Qnil;
 }
 
 VALUE
 rb_struct_initialize(VALUE self, VALUE values)
 {
-    rb_struct_initialize_m(RARRAY_LENINT(values), RARRAY_CONST_PTR(values), self);
-    if (rb_obj_is_kind_of(self, rb_cData)) OBJ_FREEZE(self);
+    if (rb_obj_is_kind_of(self, rb_cData)) {
+        rb_struct_modify(self);
+        /* Marshal.load of a Data passes every member, in order. */
+        long n = RSTRUCT_LEN_RAW(self);
+        if (n < RARRAY_LEN(values)) rb_raise(rb_eArgError, "struct size differs");
+        for (long i = 0; i < n; i++) {
+            RSTRUCT_SET_RAW(self, i, i < RARRAY_LEN(values) ? RARRAY_AREF(values, i) : Qnil);
+        }
+        OBJ_FREEZE(self);
+    }
+    else {
+        rb_vm_call_kw(GET_EC(), self, idInitialize, RARRAY_LENINT(values), RARRAY_CONST_PTR(values),
+                      struct_init_cme, RB_NO_KEYWORDS);
+    }
     RB_GC_GUARD(values);
     return Qnil;
 }
@@ -2305,7 +2310,7 @@ InitVM_Struct(void)
     rb_define_singleton_method(rb_cStruct, "members", rb_struct_s_members_m, 0);
 #endif
 
-    rb_define_method(rb_cStruct, "initialize", rb_struct_initialize_m, -1);
+    /* Struct#initialize is defined by struct.rb. */
     rb_define_method(rb_cStruct, "initialize_copy", rb_struct_init_copy, 1);
 
     rb_define_method(rb_cStruct, "==", rb_struct_equal, 1);
@@ -2362,6 +2367,8 @@ InitVM_Struct(void)
 
     rb_define_method(rb_cData, "with", rb_data_with, -1);
 }
+
+#include "struct.rbinc"
 
 #undef rb_intern
 void
