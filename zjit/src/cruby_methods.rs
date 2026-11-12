@@ -79,11 +79,19 @@ impl Annotations {
 }
 
 fn annotate_c_method(props_map: &mut HashMap<*mut c_void, FnProperties>, class: VALUE, method_name: &'static str, props: FnProperties) {
+    let method_id = unsafe { rb_intern2(method_name.as_ptr().cast(), method_name.len() as _) };
+    annotate_c_method_id(props_map, class, method_id, props);
+}
+
+unsafe extern "C" {
+    fn rb_struct_init_c_cme() -> *const rb_callable_method_entry_t;
+}
+
+fn annotate_c_method_id(props_map: &mut HashMap<*mut c_void, FnProperties>, class: VALUE, method_id: ID, props: FnProperties) {
     // Lookup function pointer of the C method
     let fn_ptr = unsafe {
         // TODO(alan): (side quest) make rust methods and clean up glue code for rb_method_cfunc_t and
         // rb_method_definition_t.
-        let method_id = rb_intern2(method_name.as_ptr().cast(), method_name.len() as _);
         let method = rb_method_entry_at(class, method_id);
         assert!(!method.is_null());
         // ME-to-CME cast is fine due to identical layout
@@ -263,7 +271,12 @@ pub fn init() -> Annotations {
     annotate!(rb_cBasicObject, "==", inline_basic_object_eq, types::BoolExact, no_gc, leaf, elidable);
     annotate!(rb_cBasicObject, "!", inline_basic_object_not, types::BoolExact, no_gc, leaf, elidable);
     annotate!(rb_cBasicObject, "initialize", inline_basic_object_initialize);
-    annotate!(rb_cStruct, "initialize", inline_struct_initialize);
+    // Struct#initialize is OPTIMIZED_METHOD_TYPE_STRUCT_INIT; its non-keyword calls go to this hidden cfunc.
+    {
+        let mut props = FnProperties::default();
+        props.inline = inline_struct_initialize;
+        cfuncs.insert(unsafe { get_mct_func(get_cme_def_body_cfunc(rb_struct_init_c_cme())) }, props);
+    }
     annotate!(rb_cClass, "allocate", inline_class_allocate);
     annotate!(rb_cClass, "superclass", inline_class_superclass, types::Class.union(types::NilClass));
     annotate!(rb_cInteger, "succ", inline_integer_succ);

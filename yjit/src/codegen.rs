@@ -9204,6 +9204,10 @@ fn gen_send_dynamic<F: Fn(&mut Assembler) -> Opnd>(
     jump_to_next_insn(jit, asm)
 }
 
+unsafe extern "C" {
+    fn rb_struct_init_target(klass: VALUE, ci: *const rb_callinfo) -> *const rb_callable_method_entry_t;
+}
+
 fn gen_send_general(
     jit: &mut JITState,
     asm: &mut Assembler,
@@ -9613,6 +9617,12 @@ fn gen_send_general(
                             flags,
                             argc,
                         );
+                    }
+                    OPTIMIZED_METHOD_TYPE_STRUCT_INIT => {
+                        // Struct#initialize picks its body from the callinfo, which is fixed here.
+                        cme = unsafe { rb_struct_init_target(comptime_recv_klass, ci) };
+                        jit.assume_method_lookup_stable(asm, cme);
+                        continue;
                     }
                     _ => {
                         panic!("unknown optimized method type!")

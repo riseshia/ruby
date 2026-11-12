@@ -709,6 +709,10 @@ impl From<u32> for MethodType {
     }
 }
 
+unsafe extern "C" {
+    fn rb_struct_init_target(klass: VALUE, ci: *const rb_callinfo) -> *const rb_callable_method_entry_t;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OptimizedMethodType {
     Send,
@@ -716,6 +720,7 @@ pub enum OptimizedMethodType {
     BlockCall,
     StructAref,
     StructAset,
+    StructInit,
 }
 
 impl From<u32> for OptimizedMethodType {
@@ -726,6 +731,7 @@ impl From<u32> for OptimizedMethodType {
             OPTIMIZED_METHOD_TYPE_BLOCK_CALL => OptimizedMethodType::BlockCall,
             OPTIMIZED_METHOD_TYPE_STRUCT_AREF => OptimizedMethodType::StructAref,
             OPTIMIZED_METHOD_TYPE_STRUCT_ASET => OptimizedMethodType::StructAset,
+            OPTIMIZED_METHOD_TYPE_STRUCT_INIT => OptimizedMethodType::StructInit,
             _ => unreachable!("unknown send_without_block optimized method type: {}", value),
         }
     }
@@ -5039,6 +5045,12 @@ impl Function {
                         let mut def_type = unsafe { get_cme_def_type(cme) };
                         while def_type == VM_METHOD_TYPE_ALIAS {
                             cme = unsafe { rb_aliased_callable_method_entry(cme) };
+                            def_type = unsafe { get_cme_def_type(cme) };
+                        }
+                        // Struct#initialize picks its body from the callinfo, which is fixed here.
+                        if def_type == VM_METHOD_TYPE_OPTIMIZED
+                            && unsafe { get_cme_def_body_optimized_type(cme) } == OPTIMIZED_METHOD_TYPE_STRUCT_INIT {
+                            cme = unsafe { rb_struct_init_target(klass, ci) };
                             def_type = unsafe { get_cme_def_type(cme) };
                         }
 

@@ -379,6 +379,7 @@ make_counters! {
     unspecialized_send_def_type_optimized_block_call,
     unspecialized_send_def_type_optimized_struct_aref,
     unspecialized_send_def_type_optimized_struct_aset,
+    unspecialized_send_def_type_optimized_struct_init,
 
     // Method call def_type related to send fallback to dynamic dispatch
     unspecialized_send_def_type_iseq,
@@ -714,6 +715,7 @@ pub fn send_fallback_counter_for_optimized_method_type(method_type: crate::hir::
         BlockCall => unspecialized_send_def_type_optimized_block_call,
         StructAref => unspecialized_send_def_type_optimized_struct_aref,
         StructAset => unspecialized_send_def_type_optimized_struct_aset,
+        StructInit => unspecialized_send_def_type_optimized_struct_init,
     }
 }
 
