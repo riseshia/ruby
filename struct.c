@@ -19,7 +19,11 @@
 #include "internal/struct.h"
 #include "internal/symbol.h"
 #include "vm_core.h"
+#include "vm_callinfo.h"
+#include "iseq.h"
 #include "builtin.h"
+
+rb_cref_t *rb_vm_cref_new_toplevel(void);
 
 /* only for struct[:field] access */
 enum {
@@ -33,8 +37,11 @@ enum {
 VALUE rb_cStruct;
 static VALUE rb_cData;
 static ID id_members, id_back_members, id_keyword_init;
+/* Ivar of a Struct class holding its keyword ISEQ method entry. */
+static ID id_struct_kw_init;
 
 static VALUE struct_alloc(VALUE);
+static void struct_define_kw_init(VALUE klass, VALUE members);
 
 static inline VALUE
 struct_ivar_get(VALUE c, ID id)
@@ -381,6 +388,9 @@ setup_struct(VALUE nstr, VALUE members)
 {
     rb_len_t i, len;
 
+    /* Class ivars are looked up from the newest one, and struct_alloc() looks
+     * up __members__ on every allocation, so add this before it. */
+    rb_ivar_set(nstr, id_struct_kw_init, Qnil);
     members = struct_set_members(nstr, members);
 
     rb_define_alloc_func(nstr, struct_alloc);
@@ -719,6 +729,9 @@ rb_struct_s_def(int argc, VALUE *argv, VALUE klass)
     }
     setup_struct(st, rest);
     rb_ivar_set(st, id_keyword_init, keyword_init);
+    if (keyword_init != Qfalse && !getenv("RUBY_STRUCT_C_INIT")) {
+        struct_define_kw_init(st, rest);
+    }
     if (rb_block_given_p()) {
         rb_mod_module_eval(0, 0, st);
     }
@@ -834,6 +847,194 @@ rb_struct_initialize_m(int argc, const VALUE *argv, VALUE self)
     }
     return Qnil;
 }
+
+/*
+ * Struct#initialize is OPTIMIZED_METHOD_TYPE_STRUCT_INIT. A call with only
+ * known keywords (fixed at the call site by the callinfo) goes to a
+ * per-class ISEQ
+ *
+ *   kw_init(m0: nil, ..., m(n-1): nil)
+ *
+ * so the VM binds the keywords to locals without building a Hash. Every
+ * other call goes to the original C function, rb_struct_initialize_m.
+ */
+static ID id_struct_hidden_aset[VM_KW_SPECIFIED_BITS_MAX];
+
+static const rb_callable_method_entry_t *struct_init_c_cme;
+
+const rb_callable_method_entry_t *
+rb_struct_init_c_cme(void)
+{
+    return struct_init_c_cme;
+}
+
+
+/* Only keywords, no splat. Depends only on what call caches are keyed by. */
+bool
+rb_struct_init_kw_shape_p(const struct rb_callinfo *ci)
+{
+    const struct rb_callinfo_kwarg *kwarg = vm_ci_kwarg(ci);
+    return kwarg && kwarg->keyword_len == (int)vm_ci_argc(ci) &&
+        !(vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING));
+}
+
+/* kw_init of klass when every keyword of ci is a member, otherwise NULL. */
+const rb_callable_method_entry_t *
+rb_struct_kw_init_cme(VALUE klass, const struct rb_callinfo *ci)
+{
+    VALUE kw_init_v = struct_ivar_get(klass, id_struct_kw_init);
+    if (NIL_P(kw_init_v)) return NULL;
+    const rb_callable_method_entry_t *kw_init = (const rb_callable_method_entry_t *)kw_init_v;
+
+    const struct rb_callinfo_kwarg *kwarg = vm_ci_kwarg(ci);
+    VALUE members = struct_ivar_get(klass, id_members);
+    for (int i = 0; i < kwarg->keyword_len; i++) {
+        if (!rb_ary_includes(members, kwarg->keywords[i])) return NULL;
+    }
+    return kw_init;
+}
+
+const rb_callable_method_entry_t *
+rb_struct_init_target(VALUE klass, const struct rb_callinfo *ci)
+{
+    const rb_callable_method_entry_t *kw_init;
+    if (rb_struct_init_kw_shape_p(ci) && (kw_init = rb_struct_kw_init_cme(klass, ci))) {
+        return kw_init;
+    }
+    return struct_init_c_cme;
+}
+
+/*
+ * The arrays and hashes given to rb_iseq_load() hold symbols of internal IDs,
+ * which cannot be inspected. Hide them so ObjectSpace never yields them.
+ */
+static VALUE
+iseq_hidden_ary(long capa)
+{
+    return rb_ary_hidden_new(capa);
+}
+
+static VALUE
+iseq_hidden_hash(void)
+{
+    VALUE hash = rb_hash_new();
+    RBASIC_CLEAR_CLASS(hash);
+    return hash;
+}
+
+static VALUE
+iseq_hidden_from_args(long n, ...)
+{
+    VALUE ary = rb_ary_hidden_new(n);
+    va_list ap;
+    va_start(ap, n);
+    for (long i = 0; i < n; i++) rb_ary_push(ary, va_arg(ap, VALUE));
+    va_end(ap);
+    return ary;
+}
+
+struct iseq_ary_builder {
+    VALUE body;
+    long insn_count;
+    int local_size;
+};
+
+#define ISEQ_SYM(s) ID2SYM(rb_intern(s))
+
+static void
+iseq_insn(struct iseq_ary_builder *b, const char *name, int argc, ...)
+{
+    VALUE insn = iseq_hidden_ary(argc + 1);
+    rb_ary_push(insn, ISEQ_SYM(name));
+    va_list ap;
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) {
+        rb_ary_push(insn, va_arg(ap, VALUE));
+    }
+    va_end(ap);
+    rb_ary_push(b->body, insn);
+    b->insn_count++;
+}
+
+/* Local operand for getlocal/setlocal: index counted from the EP. */
+static VALUE
+iseq_lidx(struct iseq_ary_builder *b, long i)
+{
+    return INT2FIX(b->local_size - i + VM_ENV_DATA_SIZE - 1);
+}
+
+static VALUE
+iseq_calldata(ID mid, int flag, int argc)
+{
+    VALUE cd = iseq_hidden_hash();
+    rb_hash_aset(cd, ISEQ_SYM("mid"), ID2SYM(mid));
+    rb_hash_aset(cd, ISEQ_SYM("flag"), INT2FIX(flag));
+    rb_hash_aset(cd, ISEQ_SYM("orig_argc"), INT2FIX(argc));
+    return cd;
+}
+
+static void
+struct_define_kw_init(VALUE klass, VALUE members)
+{
+    long n = RARRAY_LEN(members);
+    if (n == 0 || n > VM_KW_SPECIFIED_BITS_MAX) return;
+
+    /* locals: m0..m(n-1), kwbits */
+    struct iseq_ary_builder b = { iseq_hidden_ary(0), 0, (int)(n + 1) };
+    rb_ary_push(b.body, ISEQ_SYM("RUBY_EVENT_CALL"));
+    VALUE locals = iseq_hidden_ary(b.local_size);
+    VALUE keywords = iseq_hidden_ary(n);
+    for (long j = 0; j < n; j++) {
+        VALUE sym = RARRAY_AREF(members, j);
+        rb_ary_push(locals, sym);
+        rb_ary_push(keywords, rb_ary_new_from_args(2, sym, Qnil));
+
+        /* A user-overridden `a=` must not change initialize semantics. */
+        rb_add_method_optimized(klass, id_struct_hidden_aset[j], OPTIMIZED_METHOD_TYPE_STRUCT_ASET,
+                                (unsigned int)j, METHOD_VISI_PRIVATE);
+        iseq_insn(&b, "putself", 0);
+        iseq_insn(&b, "getlocal_WC_0", 1, iseq_lidx(&b, j));
+        iseq_insn(&b, "opt_send_without_block", 1,
+                  iseq_calldata(id_struct_hidden_aset[j], VM_CALL_FCALL | VM_CALL_ARGS_SIMPLE, 1));
+        iseq_insn(&b, "pop", 0);
+    }
+    rb_ary_push(locals, INT2FIX(0));
+    iseq_insn(&b, "putnil", 0);
+    rb_ary_push(b.body, ISEQ_SYM("RUBY_EVENT_RETURN"));
+    iseq_insn(&b, "leave", 0);
+
+    VALUE params = iseq_hidden_hash();
+    rb_hash_aset(params, ISEQ_SYM("keyword"), keywords);
+    rb_hash_aset(params, ISEQ_SYM("kwbits"), LONG2FIX(n));
+
+    VALUE node_ids = iseq_hidden_ary(b.insn_count);
+    for (long i = 0; i < b.insn_count; i++) rb_ary_push(node_ids, INT2FIX(0));
+
+    VALUE misc = iseq_hidden_hash();
+    rb_hash_aset(misc, ISEQ_SYM("arg_size"), INT2FIX(b.local_size));
+    rb_hash_aset(misc, ISEQ_SYM("local_size"), INT2FIX(b.local_size));
+    rb_hash_aset(misc, ISEQ_SYM("stack_max"), INT2FIX(2));
+    rb_hash_aset(misc, ISEQ_SYM("node_id"), INT2FIX(0));
+    rb_hash_aset(misc, ISEQ_SYM("node_ids"), node_ids);
+    rb_hash_aset(misc, ISEQ_SYM("parser"), ISEQ_SYM("prism"));
+
+    VALUE data = iseq_hidden_from_args(14,
+        rb_str_new_cstr("YARVInstructionSequence/SimpleDataFormat"),
+        INT2FIX(ISEQ_MAJOR_VERSION), INT2FIX(ISEQ_MINOR_VERSION), INT2FIX(1),
+        misc, rb_str_new_cstr("initialize"), rb_str_new_cstr("<internal:struct>"), Qnil,
+        INT2FIX(1), ISEQ_SYM("method"), locals, params, iseq_hidden_ary(0), b.body);
+
+    const rb_iseq_t *iseq = rb_iseqw_to_iseq(rb_iseq_load(data, Qnil, Qnil));
+    /* Named initialize and owned by Struct, as TracePoint and backtraces show it;
+     * kept in an ivar, out of the method table. */
+    rb_method_definition_t *def = rb_method_definition_create(VM_METHOD_TYPE_ISEQ, idInitialize);
+    rb_method_entry_t *me = rb_method_entry_create(idInitialize, rb_cStruct, METHOD_VISI_PRIVATE, NULL);
+    rb_method_iseq_t body = { .iseqptr = iseq, .cref = rb_vm_cref_new_toplevel() };
+    rb_method_definition_set(me, def, &body);
+    rb_ivar_set(klass, id_struct_kw_init, (VALUE)me);
+}
+
+#undef ISEQ_SYM
 
 VALUE
 rb_struct_initialize(VALUE self, VALUE values)
@@ -2305,7 +2506,22 @@ InitVM_Struct(void)
     rb_define_singleton_method(rb_cStruct, "members", rb_struct_s_members_m, 0);
 #endif
 
-    rb_define_method(rb_cStruct, "initialize", rb_struct_initialize_m, -1);
+    {
+        /* Named initialize and owned by Struct, as TracePoint and backtraces
+         * show it; kept out of the method table. */
+        rb_method_definition_t *def = rb_method_definition_create(VM_METHOD_TYPE_CFUNC, idInitialize);
+        rb_method_entry_t *me = rb_method_entry_create(idInitialize, rb_cStruct, METHOD_VISI_PRIVATE, NULL);
+        rb_method_cfunc_t cfunc = { .func = (VALUE (*)(ANYARGS))rb_struct_initialize_m, .argc = -1 };
+        rb_method_definition_set(me, def, &cfunc);
+        struct_init_c_cme = (const rb_callable_method_entry_t *)me;
+    }
+    rb_vm_register_global_object((VALUE)struct_init_c_cme);
+    if (getenv("RUBY_STRUCT_C_INIT")) {
+        rb_define_method(rb_cStruct, "initialize", rb_struct_initialize_m, -1);
+    }
+    else {
+        rb_add_method_optimized(rb_cStruct, idInitialize, OPTIMIZED_METHOD_TYPE_STRUCT_INIT, 0, METHOD_VISI_PRIVATE);
+    }
     rb_define_method(rb_cStruct, "initialize_copy", rb_struct_init_copy, 1);
 
     rb_define_method(rb_cStruct, "==", rb_struct_equal, 1);
@@ -2370,6 +2586,10 @@ Init_Struct(void)
     id_members = rb_intern("__members__");
     id_back_members = rb_intern("__members_back__");
     id_keyword_init = rb_intern("__keyword_init__");
+    id_struct_kw_init = rb_make_internal_id();
+    for (int i = 0; i < VM_KW_SPECIFIED_BITS_MAX; i++) {
+        id_struct_hidden_aset[i] = rb_make_internal_id();
+    }
 
     InitVM(Struct);
 }

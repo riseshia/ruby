@@ -4918,8 +4918,9 @@ vm_call_opt_struct_aset(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
 NOINLINE(static VALUE vm_call_optimized(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling,
                                         const struct rb_callinfo *ci, const struct rb_callcache *cc));
 
+/* Methods named by rb_make_internal_id() are VM internals and fire no events. */
 #define VM_CALL_METHOD_ATTR(var, func, nohook) \
-    if (UNLIKELY(ruby_vm_c_events_enabled > 0)) { \
+    if (UNLIKELY(ruby_vm_c_events_enabled > 0) && rb_id2str(vm_cc_cme(cc)->def->original_id)) { \
         EXEC_EVENT_HOOK(ec, RUBY_EVENT_C_CALL, calling->recv, vm_cc_cme(cc)->def->original_id, \
                         vm_ci_mid(ci), vm_cc_cme(cc)->owner, Qundef); \
         var = func; \
@@ -4930,6 +4931,21 @@ NOINLINE(static VALUE vm_call_optimized(rb_execution_context_t *ec, rb_control_f
         nohook; \
         var = func; \
     }
+
+static VALUE
+vm_call_struct_init_c(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling)
+{
+    calling->cc = &VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, rb_struct_init_c_cme());
+    return vm_call_method_each_type(ec, cfp, calling);
+}
+
+static VALUE
+vm_call_struct_init_kw(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling)
+{
+    const rb_callable_method_entry_t *cme = rb_struct_kw_init_cme(CLASS_OF(calling->recv), calling->cd->ci);
+    calling->cc = &VM_CC_ON_STACK(Qundef, vm_call_general, {{ 0 }}, cme ? cme : rb_struct_init_c_cme());
+    return vm_call_method_each_type(ec, cfp, calling);
+}
 
 static VALUE
 vm_call_optimized(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling,
@@ -4967,6 +4983,15 @@ vm_call_optimized(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb
                             CC_SET_FASTPATH(cc, vm_call_opt_struct_aset, (vm_ci_flag(ci) & VM_CALL_ARGS_SIMPLE)))
         return v;
       }
+      case OPTIMIZED_METHOD_TYPE_STRUCT_INIT:
+        /* The call cache is shared by call sites with the same argc, flags and
+         * keyword count, so only that part of the decision is cached. */
+        if (rb_struct_init_kw_shape_p(ci)) {
+            CC_SET_FASTPATH(cc, vm_call_struct_init_kw, TRUE);
+            return vm_call_struct_init_kw(ec, cfp, calling);
+        }
+        CC_SET_FASTPATH(cc, vm_call_struct_init_c, TRUE);
+        return vm_call_struct_init_c(ec, cfp, calling);
       default:
         rb_bug("vm_call_method: unsupported optimized method type (%d)", vm_cc_cme(cc)->def->body.optimized.type);
     }

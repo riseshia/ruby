@@ -561,7 +561,8 @@ pub const OPTIMIZED_METHOD_TYPE_CALL: method_optimized_type = 1;
 pub const OPTIMIZED_METHOD_TYPE_BLOCK_CALL: method_optimized_type = 2;
 pub const OPTIMIZED_METHOD_TYPE_STRUCT_AREF: method_optimized_type = 3;
 pub const OPTIMIZED_METHOD_TYPE_STRUCT_ASET: method_optimized_type = 4;
-pub const OPTIMIZED_METHOD_TYPE__MAX: method_optimized_type = 5;
+pub const OPTIMIZED_METHOD_TYPE_STRUCT_INIT: method_optimized_type = 5;
+pub const OPTIMIZED_METHOD_TYPE__MAX: method_optimized_type = 6;
 pub type method_optimized_type = u32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

@@ -308,6 +308,9 @@ vm_call0_body(rb_execution_context_t *ec, struct rb_calling_info *calling, const
                                 vm_call_opt_struct_aset0(ec, calling, argv[0]),
                                 (void)0);
             goto success;
+          case OPTIMIZED_METHOD_TYPE_STRUCT_INIT:
+            /* No static callinfo here (send, Method#call, rb_funcall): always C. */
+            return vm_call0_cme(ec, calling, argv, rb_struct_init_c_cme());
           default:
             rb_bug("vm_call0: unsupported optimized method type (%d)", vm_cc_cme(cc)->def->body.optimized.type);
         }

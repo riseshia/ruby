@@ -48,6 +48,12 @@ VALUE rb_struct_init_copy(VALUE copy, VALUE s);
 VALUE rb_struct_lookup(VALUE s, VALUE idx);
 VALUE rb_struct_s_keyword_init(VALUE klass);
 void rb_struct_define_aref_method(VALUE nstr, ID name, unsigned int off);
+struct rb_callinfo;
+struct rb_callable_method_entry_struct;
+const struct rb_callable_method_entry_struct *rb_struct_init_target(VALUE klass, const struct rb_callinfo *ci);
+const struct rb_callable_method_entry_struct *rb_struct_init_c_cme(void);
+bool rb_struct_init_kw_shape_p(const struct rb_callinfo *ci);
+const struct rb_callable_method_entry_struct *rb_struct_kw_init_cme(VALUE klass, const struct rb_callinfo *ci);
 
 static inline rb_len_t RSTRUCT_EMBED_LEN(VALUE st);
 static inline rb_len_t RSTRUCT_LEN_RAW(VALUE st);
